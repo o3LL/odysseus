@@ -1,0 +1,9 @@
+use_default_settings: true
+
+server:
+  secret_key: "odysseus-local-searxng-json-2026-05-30"
+
+search:
+  formats:
+    - html
+    - json
