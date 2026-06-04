@@ -10,6 +10,7 @@ import { attachColorPicker } from './colorPicker.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import { snapModalToZone } from './tileManager.js';
 import { applyEdgeDock, clearDockSide } from './modalSnap.js';
+import { mdToHtml } from './markdown.js';
 
 const API_BASE = window.location.origin;
 let _open = false;
@@ -1849,6 +1850,9 @@ function _renderNotes() {
         : `<button class="note-card-done" data-note-id="${note.id}" title="Mark done" aria-label="Mark done">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
           </button>
+          <button class="note-card-preview" data-note-id="${note.id}" title="Preview" aria-label="Preview note">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+          </button>
           ${_hasItems(note) ? `<button class="note-card-copy note-card-copy-corner" data-note-id="${note.id}" title="Copy all items" aria-label="Copy all items">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>` : ''}`}
@@ -2330,6 +2334,13 @@ function _bindCardEvents(body) {
       } else {
         finish();
       }
+    });
+  });
+  // Preview button — opens note in a floating markdown-rendered window.
+  body.querySelectorAll('.note-card-preview').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _openNotePreview(btn.dataset.noteId);
     });
   });
   // Unarchive corner — only visible in archive view.
@@ -4485,6 +4496,91 @@ async function _deleteNote(id) {
   if (!ok) return;
   try { await _deleteNoteApi(id); await _fetchNotes(); _renderNotes(); uiModule.showToast('Deleted'); }
   catch (err) { uiModule.showError(err.message); }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// NOTE PREVIEW — floating window with full markdown rendering.
+// Uses the standard .modal / .modal-content pattern so it behaves like
+// other tool windows: no backdrop, app stays usable, minimize-to-dock.
+// ────────────────────────────────────────────────────────────────────
+
+function _notePreviewContentHtml(note) {
+  let html = '';
+  if (note.note_type !== 'checklist' && note.content) {
+    html += `<div class="note-preview-body md-body">${mdToHtml(note.content)}</div>`;
+  }
+  if (_hasItems(note) && note.items?.length) {
+    html += `<ul class="note-preview-checklist">${note.items.map(item =>
+      `<li class="note-preview-cl-item${item.done ? ' done' : ''}">
+        <span class="note-preview-cl-dot">${item.done
+          ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+          : ''
+        }</span>
+        <span class="note-preview-cl-text">${_esc(item.text)}</span>
+      </li>`
+    ).join('')}</ul>`;
+  }
+  if (!html) html = '<p class="note-preview-empty">No content</p>';
+  return html;
+}
+
+function _openNotePreview(id) {
+  const note = _notes.find(n => n.id === id);
+  if (!note) return;
+
+  // If already open or minimized, update content and restore.
+  const existing = document.getElementById('note-preview-modal');
+  if (existing) {
+    const titleEl = existing.querySelector('.note-preview-title');
+    if (titleEl) titleEl.textContent = note.title || 'Untitled';
+    const bodyEl = existing.querySelector('.note-preview-body-wrap');
+    if (bodyEl) bodyEl.innerHTML = _notePreviewContentHtml(note);
+    if (Modals.isMinimized('note-preview-modal')) Modals.restore('note-preview-modal');
+    existing.classList.remove('hidden');
+    return;
+  }
+
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.id = 'note-preview-modal';
+
+  const content = document.createElement('div');
+  content.className = 'modal-content note-preview-modal-content';
+  content.innerHTML = `
+    <div class="modal-header">
+      <h4 class="note-preview-title">${_esc(note.title || 'Untitled')}</h4>
+      <button class="modal-close" title="Close" aria-label="Close preview">&times;</button>
+    </div>
+    <div class="modal-body note-preview-body-wrap">
+      ${_notePreviewContentHtml(note)}
+    </div>
+  `;
+
+  modal.appendChild(content);
+  document.body.appendChild(modal);
+
+  const closeFn = () => {
+    modal.remove();
+    Modals.unregister('note-preview-modal');
+  };
+
+  const rawTitle = note.title || 'Untitled';
+  const chipLabel = ('Note: ' + rawTitle).length > 28
+    ? 'Note: ' + rawTitle.slice(0, 21) + '…'
+    : 'Note: ' + rawTitle;
+
+  Modals.register('note-preview-modal', {
+    restoreFn: () => {},
+    closeFn,
+    label: chipLabel,
+    icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>',
+  });
+  Modals.injectMinimizeButton(modal, 'note-preview-modal');
+
+  const header = content.querySelector('.modal-header');
+  makeWindowDraggable(modal, { content, header });
+
+  content.querySelector('.modal-close').addEventListener('click', closeFn);
 }
 
 // ────────────────────────────────────────────────────────────────────
