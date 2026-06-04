@@ -29613,6 +29613,7 @@ body.notes-mobile-mode .note-card-corner-trash,
 body.notes-mobile-mode .note-card-corner-unarchive,
 body.notes-mobile-mode .note-card-corner-done,
 body.notes-mobile-mode .note-card-edit-corner,
+body.notes-mobile-mode .note-card-preview { right: 6px; }
 body.notes-mobile-mode .note-card-done,
 body.notes-mobile-mode .note-card-actions,
 body.notes-mobile-mode .note-cl-quickadd,
