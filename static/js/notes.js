@@ -590,8 +590,10 @@ function _isNoteFullyDone(note) {
 
 // A "checklist note" — todo or goal — has structured items[] that the cards
 // render as checkboxes and that "fully done" / progress logic reads from.
+// TODO: 'todo' and 'checklist' are functionally identical — one should be
+// deprecated and removed. Keeping both here until the data model is cleaned up.
 function _hasItems(note) {
-  return note && (note.note_type === 'todo' || note.note_type === 'goal');
+  return note && (note.note_type === 'todo' || note.note_type === 'goal' || note.note_type === 'checklist');
 }
 
 // Compact " N/M" progress string for a goal's checklist. Empty when the goal
@@ -4525,9 +4527,9 @@ function _notePreviewContentHtml(note) {
   if (note.note_type !== 'checklist' && note.content) {
     html += `<div class="note-preview-body md-body">${mdToHtml(note.content)}</div>`;
   }
-  if (_hasItems(note) && note.items?.length) {
+  if (Array.isArray(note.items) && note.items.length) {
     html += `<ul class="note-preview-checklist" data-note-id="${note.id}">${note.items.map((item, idx) =>
-      `<li class="note-preview-cl-item${item.done ? ' done' : ''}" data-idx="${idx}">
+      `<li class="note-preview-cl-item${item.done ? ' done' : ''}" data-idx="${idx}" style="${item.indent ? `padding-left:${item.indent * 16}px` : ''}">
         <span class="note-preview-cl-dot">${item.done
           ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
           : ''
