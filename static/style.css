@@ -30779,6 +30779,16 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   align-items: center;
   gap: 8px;
   font-size: 0.9rem;
+  cursor: pointer;
+  padding: 3px 4px;
+  border-radius: 5px;
+  transition: background 0.12s;
+}
+.note-preview-cl-item:hover {
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+}
+.note-preview-cl-item:hover .note-preview-cl-dot {
+  border-color: var(--green, #98c379);
 }
 .note-preview-cl-item.done .note-preview-cl-text {
   text-decoration: line-through;
@@ -30795,6 +30805,7 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   flex-shrink: 0;
   color: var(--green, #98c379);
   background: transparent;
+  transition: border-color 0.12s, background 0.12s;
 }
 .note-preview-cl-item.done .note-preview-cl-dot {
   background: color-mix(in srgb, var(--green, #98c379) 20%, transparent);

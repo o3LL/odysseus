@@ -1683,8 +1683,22 @@ function _animateReflow(prevPositions) {
   });
 }
 
+function _syncNotePreview() {
+  const modal = document.getElementById('note-preview-modal');
+  if (!modal) return;
+  const noteId = modal.dataset.previewNoteId;
+  if (!noteId) return;
+  const note = _notes.find(n => n.id === noteId);
+  if (!note) return;
+  const bodyEl = modal.querySelector('.note-preview-body-wrap');
+  if (!bodyEl) return;
+  bodyEl.innerHTML = _notePreviewContentHtml(note);
+  _bindPreviewChecklist(bodyEl);
+}
+
 function _renderNotes() {
   _updateRailBadge();
+  _syncNotePreview();
   const body = document.querySelector('#notes-pane .notes-pane-body');
   if (!body) return;
   const prevPositions = _captureCardPositions();
@@ -2548,6 +2562,7 @@ function _bindCardEvents(body) {
       const wasAllDone = note.items.length > 0 && note.items.every(it => it.done);
       note.items[idx].done = !note.items[idx].done;
       el.classList.toggle('done', note.items[idx].done);
+      _syncNotePreview();
       const isAllDone = note.items.length > 0 && note.items.every(it => it.done);
       if (!wasAllDone && isAllDone) {
         const card = el.closest('.note-card');
@@ -2559,6 +2574,7 @@ function _bindCardEvents(body) {
       _patchNote(noteId, { items: note.items }).catch(() => {
         note.items[idx].done = !note.items[idx].done;
         el.classList.toggle('done', note.items[idx].done);
+        _syncNotePreview();
       });
     });
   });
@@ -4510,8 +4526,8 @@ function _notePreviewContentHtml(note) {
     html += `<div class="note-preview-body md-body">${mdToHtml(note.content)}</div>`;
   }
   if (_hasItems(note) && note.items?.length) {
-    html += `<ul class="note-preview-checklist">${note.items.map(item =>
-      `<li class="note-preview-cl-item${item.done ? ' done' : ''}">
+    html += `<ul class="note-preview-checklist" data-note-id="${note.id}">${note.items.map((item, idx) =>
+      `<li class="note-preview-cl-item${item.done ? ' done' : ''}" data-idx="${idx}">
         <span class="note-preview-cl-dot">${item.done
           ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
           : ''
@@ -4524,6 +4540,44 @@ function _notePreviewContentHtml(note) {
   return html;
 }
 
+function _bindPreviewChecklist(container) {
+  container.querySelectorAll('.note-preview-checklist').forEach(list => {
+    list.addEventListener('click', async (e) => {
+      const li = e.target.closest('.note-preview-cl-item');
+      if (!li) return;
+      const id = list.dataset.noteId;
+      const idx = parseInt(li.dataset.idx);
+      const note = _notes.find(n => n.id === id);
+      if (!note || !Array.isArray(note.items) || !note.items[idx]) return;
+
+      note.items[idx].done = !note.items[idx].done;
+      const nowDone = note.items[idx].done;
+
+      // Update the clicked row immediately
+      li.classList.toggle('done', nowDone);
+      li.querySelector('.note-preview-cl-dot').innerHTML = nowDone
+        ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+        : '';
+
+      try {
+        await _patchNote(id, { items: note.items });
+        if (note.items.every(it => it.done)) {
+          const r = li.getBoundingClientRect();
+          spawnConfetti(r.left + r.width / 2, r.top + r.height / 2, 60);
+        }
+        _renderNotes();
+      } catch {
+        // Roll back on failure
+        note.items[idx].done = !note.items[idx].done;
+        li.classList.toggle('done', !nowDone);
+        li.querySelector('.note-preview-cl-dot').innerHTML = !nowDone
+          ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+          : '';
+      }
+    });
+  });
+}
+
 function _openNotePreview(id) {
   const note = _notes.find(n => n.id === id);
   if (!note) return;
@@ -4531,10 +4585,14 @@ function _openNotePreview(id) {
   // If already open or minimized, update content and restore.
   const existing = document.getElementById('note-preview-modal');
   if (existing) {
+    existing.dataset.previewNoteId = note.id;
     const titleEl = existing.querySelector('.note-preview-title');
     if (titleEl) titleEl.textContent = note.title || 'Untitled';
     const bodyEl = existing.querySelector('.note-preview-body-wrap');
-    if (bodyEl) bodyEl.innerHTML = _notePreviewContentHtml(note);
+    if (bodyEl) {
+      bodyEl.innerHTML = _notePreviewContentHtml(note);
+      _bindPreviewChecklist(bodyEl);
+    }
     if (Modals.isMinimized('note-preview-modal')) Modals.restore('note-preview-modal');
     existing.classList.remove('hidden');
     return;
@@ -4543,6 +4601,7 @@ function _openNotePreview(id) {
   const modal = document.createElement('div');
   modal.className = 'modal';
   modal.id = 'note-preview-modal';
+  modal.dataset.previewNoteId = note.id;
 
   const content = document.createElement('div');
   content.className = 'modal-content note-preview-modal-content';
@@ -4581,6 +4640,7 @@ function _openNotePreview(id) {
   makeWindowDraggable(modal, { content, header });
 
   content.querySelector('.modal-close').addEventListener('click', closeFn);
+  _bindPreviewChecklist(content);
 }
 
 // ────────────────────────────────────────────────────────────────────
