@@ -30441,11 +30441,9 @@ body.notes-drag-mode .note-card-pin svg {
   background: color-mix(in srgb, var(--fg) 3%, transparent);
   border: 1px solid var(--border);
   border-radius: 8px;
-  /* Extra right padding so the corner buttons (pin / edit / copy / done)
-     never collide with the title, and a min-height so an empty/short
-     note is still tall enough to fit that row of corner controls. */
+  /* min-height so an empty/short note is still tall enough to fit the row of
+     corner controls. */
   padding: 10px 14px;
-  padding-right: 30px;
   min-height: 64px;
   cursor: default;
   transition: background 0.15s;
@@ -30737,6 +30735,18 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   #note-preview-modal .note-preview-modal-content {
     width: 96vw;
     max-height: 90vh;
+  }
+  /* iOS Safari auto-zooms when a focused text field is < 16px. Bump every
+     editable surface in the notes UI to 16px on mobile so focusing one (the
+     preview body, title, a tag/reminder/search input) never triggers a zoom —
+     without disabling pinch-zoom in the viewport meta (an accessibility win). */
+  #note-preview-modal .note-preview-body,
+  #note-preview-modal .note-preview-title,
+  .note-tag-input,
+  .note-reminder-date-input,
+  .note-reminder-repeat-select,
+  .notes-pane .memory-search-input {
+    font-size: 16px;
   }
 }
 #note-preview-modal .modal-header {
@@ -32067,7 +32077,7 @@ input.note-preview-title::placeholder { opacity: 0.4; }
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   color: var(--accent);
   border-radius: 999px;
-  padding: 2px 6px;
+  padding: 0 6px;
   font: inherit;
   font-size: 9px;
   font-weight: 600;
