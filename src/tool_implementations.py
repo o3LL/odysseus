@@ -1802,7 +1802,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
     """Handle manage_notes tool calls: CRUD on notes and checklists."""
     import uuid as _uuid
     from core.database import SessionLocal, Note
-    from sqlalchemy.orm.attributes import flag_modified
+    from core.notes_markdown import merge_items_into_content, parse_task_lines, toggle_task
 
     try:
         args = _parse_tool_args(content)
@@ -1843,18 +1843,15 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             lines = []
             for n in notes:
                 pin = " [PINNED]" if n.pinned else ""
-                typ = " [checklist]" if n.note_type == "checklist" else ""
+                tasks = parse_task_lines(n.content)
                 lbl = f" #{n.label}" if n.label else ""
                 title = n.title or "(untitled)"
-                lines.append(f"- [{n.id[:8]}] **{title}**{pin}{typ}{lbl}")
-                if n.note_type == "checklist" and n.items:
-                    try:
-                        items = json.loads(n.items)
-                        for i, item in enumerate(items):
-                            mark = "x" if item.get("done") else " "
-                            lines.append(f"  [{mark}] {i}: {item.get('text', '')}")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                lines.append(f"- [{n.id[:8]}] **{title}**{pin}{lbl}")
+                if tasks:
+                    # Show the checklist with its toggle indices.
+                    for t in tasks:
+                        mark = "x" if t["done"] else " "
+                        lines.append(f"  [{mark}] {t['index']}: {t['text']}")
                 elif n.content:
                     snippet = n.content[:80].replace("\n", " ")
                     lines.append(f"  {snippet}")
@@ -1872,15 +1869,15 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 title = text_raw.strip()
             elif not content_raw and text_raw:
                 content_raw = text_raw
-            # Accept both `items` (legacy/internal field) and `checklist_items`
-            # (the schema-exposed name used by native function calls). Models
-            # following the schema emit `checklist_items`; older code paths
-            # and direct API callers still use `items`.
+            # Unified model: a checklist is just `- [ ]` / `- [x]` task lines in
+            # the markdown `content`. The primary path is for the model to write
+            # those lines directly. For backward compatibility we still accept a
+            # structured `checklist_items` (or legacy `items`) array and fold it
+            # into `content` as task lines.
             items_raw = args.get("checklist_items")
             if items_raw is None:
                 items_raw = args.get("items")
-            items_json = json.dumps(items_raw) if items_raw is not None else None
-            note_type = args.get("note_type", "checklist" if items_raw else "note")
+            content_raw = merge_items_into_content(content_raw, items_raw)
             # Accept natural-language due_date ("tomorrow at 1pm") in
             # addition to ISO. Use the user-tz-aware parser so the LLM's
             # naive times ("today at 9pm") are anchored to the USER's clock,
@@ -1920,8 +1917,8 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 owner=owner,
                 title=title,
                 content=content_raw,
-                items=items_json,
-                note_type=note_type,
+                items=None,
+                note_type="note",
                 color=args.get("color"),
                 label=args.get("label"),
                 pinned=args.get("pinned", False),
@@ -1952,7 +1949,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
             if owner is not None and note.owner and note.owner != owner:
                 return {"error": "Note not found", "exit_code": 1}
-            for field in ("title", "content", "note_type", "color", "label"):
+            for field in ("title", "content", "color", "label"):
                 if field in args and args[field] is not None:
                     setattr(note, field, args[field])
             # Parse due_date the same way the `add` action does. The schema
@@ -1968,12 +1965,13 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                     note.due_date = _pdt_user(due_raw)
                 except Exception:
                     note.due_date = due_raw  # fall through; trust the model
+            # Back-compat: fold a structured items array into the markdown
+            # content (only when the content doesn't already carry task lines).
             new_items = args.get("checklist_items")
             if new_items is None:
                 new_items = args.get("items")
             if new_items is not None:
-                note.items = json.dumps(new_items)
-                flag_modified(note, "items")
+                note.content = merge_items_into_content(note.content, new_items)
             if "pinned" in args:
                 note.pinned = args["pinned"]
             if "archived" in args:
@@ -2001,17 +1999,15 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
             if owner is not None and note.owner and note.owner != owner:
                 return {"error": "Note not found", "exit_code": 1}
-            if not note.items:
-                return {"error": "Note has no checklist items", "exit_code": 1}
-            items = json.loads(note.items)
-            if index < 0 or index >= len(items):
-                return {"error": f"Item index {index} out of range (0-{len(items)-1})", "exit_code": 1}
-            items[index]["done"] = not items[index].get("done", False)
-            note.items = json.dumps(items)
-            flag_modified(note, "items")
+            try:
+                new_content, item = toggle_task(note.content, int(index))
+            except (IndexError, ValueError, TypeError):
+                n_tasks = len(parse_task_lines(note.content))
+                return {"error": f"Item index {index} out of range (0-{max(n_tasks-1, 0)})", "exit_code": 1}
+            note.content = new_content
             db.commit()
-            mark = "done" if items[index]["done"] else "undone"
-            return {"response": f"Item '{items[index].get('text', '')}' marked {mark}", "exit_code": 0}
+            mark = "done" if item["done"] else "undone"
+            return {"response": f"Item '{item['text']}' marked {mark}", "exit_code": 0}
 
         else:
             return {"error": f"Unknown action: {action}. Use list/add/update/delete/toggle_item", "exit_code": 1}
@@ -2150,8 +2146,8 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
             id=str(_uuid.uuid4()),
             owner=owner,
             title=expected_title,
-            items=json.dumps([{"text": text, "done": False, "checked": False}]),
-            note_type="todo",
+            content=f"- [ ] {text}" if text else None,
+            note_type="note",
             label="calendar",
             due_date=due_date,
             source="calendar",

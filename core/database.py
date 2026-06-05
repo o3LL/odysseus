@@ -940,6 +940,59 @@ def _migrate_add_notes_sort_order():
     except Exception as e:
         logging.getLogger(__name__).warning(f"notes migration failed: {e}")
 
+def _migrate_unify_notes():
+    """Fold the old discriminated note types into one markdown-native note.
+
+    Historically a note was one of: 'note' (markdown in `content`),
+    'todo'/'checklist' (a structured `items` JSON array), 'goal' (description in
+    `content` *plus* `items` steps), or 'draw' (`image_url`). The model is now a
+    single note whose `content` markdown carries any checklist as `- [ ]` /
+    `- [x]` task lines. This migration rewrites every note that still has a
+    populated `items` array into that form and clears `note_type` back to 'note'.
+
+    Idempotent: once `items` is NULL there is nothing left to convert, so re-runs
+    are no-ops. Drawing notes keep `image_url`; only their type label changes.
+    """
+    import sqlite3
+    import json
+    from core.notes_markdown import merge_items_into_content
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    log = logging.getLogger(__name__)
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(notes)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if not columns or "items" not in columns:
+            conn.close()
+            return
+        rows = conn.execute(
+            "SELECT id, content, items, note_type FROM notes "
+            "WHERE items IS NOT NULL AND items != '' AND items != '[]'"
+        ).fetchall()
+        converted = 0
+        for note_id, content, items_raw, note_type in rows:
+            try:
+                items = json.loads(items_raw) if items_raw else None
+            except (json.JSONDecodeError, TypeError):
+                items = None
+            new_content = merge_items_into_content(content, items)
+            conn.execute(
+                "UPDATE notes SET content = ?, items = NULL, note_type = 'note' WHERE id = ?",
+                (new_content, note_id),
+            )
+            converted += 1
+        # Normalise the remaining type labels (e.g. legacy 'draw', 'goal' with no
+        # items) so nothing downstream branches on note_type anymore.
+        conn.execute("UPDATE notes SET note_type = 'note' WHERE note_type IS NOT NULL AND note_type != 'note'")
+        conn.commit()
+        conn.close()
+        if converted:
+            log.info(f"Migrated: unified {converted} note(s) with checklist items into markdown task lists")
+    except Exception as e:
+        log.warning(f"notes unify migration skipped: {e}")
+
 def _migrate_add_mode_column():
     """Add mode column to sessions table if it doesn't exist."""
     import sqlite3
@@ -1421,15 +1474,22 @@ def _migrate_add_assistant_columns():
 
 
 class Note(TimestampMixin, Base):
-    """A Google Keep-style note or checklist."""
+    """A unified, Apple-Notes-style note.
+
+    `content` is a single markdown document and the source of truth. Checklists
+    live inside it as task lines (`- [ ] todo` / `- [x] done`) — see
+    core/notes_markdown.py. The legacy `items` / `note_type` columns are kept for
+    backward compatibility only: `items` is no longer written (the unify
+    migration folds it into `content`) and `note_type` is always "note".
+    """
     __tablename__ = "notes"
 
     id         = Column(String, primary_key=True, index=True)
     owner      = Column(String, nullable=True, index=True)
     title      = Column(String, default="")
-    content    = Column(Text, nullable=True)
-    items      = Column(Text, nullable=True)       # JSON string of [{text, done}]
-    note_type  = Column(String, default="note")     # "note" or "checklist"
+    content    = Column(Text, nullable=True)        # markdown; checklists are task lines
+    items      = Column(Text, nullable=True)        # legacy/back-compat; folded into content
+    note_type  = Column(String, default="note")     # legacy; always "note"
     color      = Column(String, nullable=True)
     label      = Column(String, nullable=True)
     pinned     = Column(Boolean, default=False)
@@ -1595,6 +1655,7 @@ def init_db():
     _migrate_add_cached_models_column()
     _migrate_add_pinned_models_column()
     _migrate_add_notes_sort_order()
+    _migrate_unify_notes()
     _migrate_add_model_type_column()
     _migrate_add_model_endpoint_refresh_columns()
     _migrate_add_model_endpoint_owner_column()
