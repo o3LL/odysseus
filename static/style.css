@@ -29612,8 +29612,7 @@ body.notes-mobile-mode .note-card-corner-copy,
 body.notes-mobile-mode .note-card-corner-trash,
 body.notes-mobile-mode .note-card-corner-unarchive,
 body.notes-mobile-mode .note-card-corner-done,
-body.notes-mobile-mode .note-card-edit-corner,
-body.notes-mobile-mode .note-card-preview { right: 6px; }
+body.notes-mobile-mode .note-card-edit-corner { right: 6px; }
 body.notes-mobile-mode .note-card-done,
 body.notes-mobile-mode .note-card-actions,
 body.notes-mobile-mode .note-cl-quickadd,
@@ -30715,46 +30714,6 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
    fallback no longer needed. */
 .note-card-selectmode .note-card-done { display: none !important; }
 
-/* Preview button — sits to the left of Mark Done, same hover pattern */
-.note-card-preview {
-  position: absolute;
-  top: 6px;
-  right: 40px;
-  width: 28px;
-  height: 28px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 50%;
-  cursor: pointer;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--fg);
-  opacity: 0;
-  touch-action: manipulation;
-  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
-  z-index: 2;
-}
-.note-card:hover .note-card-preview {
-  opacity: 0.7;
-  background: var(--panel);
-  border-color: color-mix(in srgb, var(--fg) 18%, transparent);
-}
-.note-card-preview:hover,
-.note-card-preview:focus-visible {
-  opacity: 1 !important;
-  background: color-mix(in srgb, var(--fg) 12%, var(--panel)) !important;
-  border-color: color-mix(in srgb, var(--fg) 35%, var(--border)) !important;
-}
-@media (hover: none) {
-  .note-card-preview {
-    opacity: 0.7;
-    background: var(--panel);
-    border-color: color-mix(in srgb, var(--fg) 18%, transparent);
-  }
-}
-.note-card-selectmode .note-card-preview { display: none !important; }
 
 /* Note preview modal — uses the standard .modal pattern (no backdrop,
    app stays usable) with minimize-to-dock and full drag support. */

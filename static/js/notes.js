@@ -2180,9 +2180,6 @@ function _renderNotes() {
         : `<button class="note-card-done" data-note-id="${note.id}" title="Mark done" aria-label="Mark done">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
           </button>
-          <button class="note-card-preview" data-note-id="${note.id}" title="Preview" aria-label="Preview note">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
-          </button>
           ${_hasItems(note) ? `<button class="note-card-copy note-card-copy-corner" data-note-id="${note.id}" title="Copy all items" aria-label="Copy all items">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>` : ''}`}
@@ -2674,13 +2671,8 @@ function _bindCardEvents(body) {
       }
     });
   });
-  // Preview button — opens note in a floating markdown-rendered window.
-  body.querySelectorAll('.note-card-preview').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      _openNotePreview(btn.dataset.noteId);
-    });
-  });
+  // (The dedicated Preview button was removed — tapping the note opens the
+  // preview editor now, so it was redundant.)
   // Unarchive corner — only visible in archive view.
   body.querySelectorAll('.note-card-corner-unarchive').forEach(btn => {
     btn.addEventListener('click', (e) => {
