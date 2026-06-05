@@ -2361,15 +2361,10 @@ function _wireTodayView(body) {
       const id = el.dataset.noteId;
       if (!id) return;
       // Drop the Today filter so the regular card list is back, then open the
-      // editor — the preview panel on desktop, fullscreen on mobile (same as a
-      // normal card tap; never the in-grid quick editor).
+      // preview editor (same as a normal card tap; never the old in-grid form).
       _activeFilter = null;
       _renderNotes();
-      if (_isNotesMobileMode()) {
-        _openMobileFullscreenEdit(id, document.querySelector(`.note-card[data-note-id="${id}"]`));
-      } else {
-        _openNotePreview(id);
-      }
+      _openNotePreview(id);
     });
   });
 }
@@ -2446,13 +2441,9 @@ function _renderQuickAdd(body) {
       titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length);
     }
   };
-  // Click "New note" → desktop opens the rich preview editor on a fresh empty
-  // note (no intermediate markdown box); a stray empty draft self-discards on
-  // close. Mobile expands the in-grid form, which feeds the fullscreen edit flow.
-  const startNote = () => {
-    if (_isNotesMobileMode()) { expandToForm(currentType); return; }
-    _startNoteInPreview('');
-  };
+  // Click "New note" → open a fresh note in the preview editor (desktop and
+  // mobile alike). A stray empty draft self-discards on close.
+  const startNote = () => { _startNoteInPreview(''); };
   wrap.querySelector('[data-action="new"]').addEventListener('click', startNote);
   // Photo → pick + upload an image, create a note with it embedded in the body
   // (`![](url)`), and open it in the editor. No intermediate in-grid form.
@@ -2460,17 +2451,9 @@ function _renderQuickAdd(body) {
     e.stopPropagation();
     const url = await _pickCustomBgImage();
     if (!url) return;
-    const content = `![](${url})`;
-    if (_isNotesMobileMode()) {
-      try {
-        const saved = await _saveNote({ title: '', content, note_type: 'note', label: _activeLabel || null });
-        _notes.unshift(saved);
-        _renderNotes();
-        _openMobileFullscreenEdit(saved.id);
-      } catch { (uiModule.showError || uiModule.showToast)?.('Failed to create note'); }
-      return;
-    }
-    _startNoteInPreview(content);
+    // Create a note with the image embedded and open it in the preview editor
+    // (same on desktop and mobile — no old in-grid/fullscreen form).
+    _startNoteInPreview(`![](${url})`);
   });
 }
 
@@ -2483,13 +2466,9 @@ function _bindCardEvents(body) {
         cb.checked = !cb.checked;
         cb.dispatchEvent(new Event('change'));
       }
-    } else if (_isNotesMobileMode()) {
-      // Mobile: open the per-note fullscreen edit overlay instead of the
-      // in-place form. Tiles on mobile are read-only previews.
-      _openMobileFullscreenEdit(id, cardEl);
     } else {
-      // Desktop: open the preview panel (the single rich editor) — not the
-      // in-grid quick editor.
+      // Open the preview panel — the single editor on both desktop and mobile.
+      // The old in-grid / fullscreen markdown form is no longer used for editing.
       _openNotePreview(id);
     }
   };
@@ -2618,7 +2597,7 @@ function _bindCardEvents(body) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       const id = btn.dataset.noteId;
-      if (id) _editNote(id);
+      if (id) _openNotePreview(id);
     });
   });
   // Copy corner — bottom-right, just left of the Done check. Shared with

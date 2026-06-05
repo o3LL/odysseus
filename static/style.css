@@ -30554,6 +30554,12 @@ body.notes-drag-mode .note-card-pin svg {
 }
 .note-card-select { left: -8px; }
 .note-card-pin    { right: -8px; }
+/* Mobile: the card grid clips overflow (overflow-x:hidden), so a pin/select
+   sticking out at -8px gets cut off / hidden under the panel chrome. Pull them
+   inside the card. The pin sits top-left (the right corner holds the action
+   buttons); select mode hides the pin, so they never collide there. */
+body.notes-mobile-mode .note-card-pin { top: 4px; left: 4px; right: auto; }
+body.notes-mobile-mode .note-card-select { top: 4px; left: 4px; }
 /* Pencil + checkmark glyphs both have empty space along the top of their
    24×24 viewBox, so flex-centering leaves them sitting visually high.
    Nudge the inner SVG down a touch to compensate. */
@@ -30765,6 +30771,14 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
   outline: 3px solid var(--note-ring, transparent);
   outline-offset: 2px;
   transition: outline-color 0.2s ease;
+}
+/* Mobile: the preview is the only editor, so give it a near-fullscreen sheet
+   instead of a small floating window. */
+@media (max-width: 768px) {
+  #note-preview-modal .note-preview-modal-content {
+    width: 96vw;
+    max-height: 90vh;
+  }
 }
 #note-preview-modal .modal-header {
   padding: 10px 14px 2px;
