@@ -473,6 +473,45 @@ async function _unshareNote(id, username) {
 // SVG used wherever a note's shared state is shown (badge, buttons).
 const _PEOPLE_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>';
 
+// Robot/agent icon — used by the per-note "Agent" tag + corner-menu item and
+// the per-item "solve with agent" buttons (cards + preview editor).
+const _agentSvg = (s = 14) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/></svg>`;
+
+// Build the per-item agent button (PR #2747). Click runs the agent on just this
+// todo's text. Shared by the card and preview-editor injection so there's one
+// definition / one click contract.
+function _makeTaskAgentBtn(noteId) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'md-task-agent';
+  b.contentEditable = 'false';
+  b.title = 'Solve this todo with the agent';
+  b.setAttribute('aria-label', 'Solve this todo with the agent');
+  b.innerHTML = _agentSvg(11);
+  b.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();          // don't toggle the item / open the editor
+    if (_selectMode) return;
+    const li = b.closest('.md-task');
+    const text = li?.querySelector('.md-task-text')?.textContent || '';
+    _agentSolveTodoItem(noteId, text);
+  });
+  return b;
+}
+
+// Inject the per-item agent button into every checklist row in `container`
+// (a card's .note-content-preview or the preview .note-preview-body). noteId is
+// read from the nearest [data-note-id] ancestor; the item text is taken live
+// from the DOM at click time, so it always matches what the user sees.
+function _injectTaskAgentButtons(container) {
+  container.querySelectorAll('.md-task').forEach(li => {
+    if (li.querySelector('.md-task-agent')) return;
+    if (Number.isNaN(parseInt(li.dataset.taskIndex))) return;
+    const noteId = li.closest('[data-note-id]')?.dataset.noteId;
+    if (noteId) li.appendChild(_makeTaskAgentBtn(noteId));
+  });
+}
+
 // Position a popover under an anchor, clamped to the viewport.
 function _positionPopover(menu, anchor) {
   const rect = anchor.getBoundingClientRect();
@@ -1999,14 +2038,19 @@ function _animateReflow(prevPositions) {
 function _syncNotePreview() {
   const modal = document.getElementById('note-preview-modal');
   if (!modal) return;
-  // Don't rebuild the editable body while the user is typing in it — that would
-  // wipe the caret/selection mid-edit.
-  const liveBody = modal.querySelector('.note-preview-body');
-  if (liveBody && (liveBody === document.activeElement || liveBody.contains(document.activeElement))) return;
   const noteId = modal.dataset.previewNoteId;
   if (!noteId) return;
   const note = _notes.find(n => n.id === noteId);
   if (!note) return;
+  // Refresh the footer actions unconditionally — it carries no caret, so it's
+  // safe even mid-edit, and lets e.g. the "open agent chat" button appear as
+  // soon as an agent run links a session to this note.
+  const actEl = modal.querySelector('.note-preview-actions');
+  if (actEl) actEl.innerHTML = _notePreviewActionsHtml(note);
+  // Don't rebuild the editable body while the user is typing in it — that would
+  // wipe the caret/selection mid-edit.
+  const liveBody = modal.querySelector('.note-preview-body');
+  if (liveBody && (liveBody === document.activeElement || liveBody.contains(document.activeElement))) return;
   const bodyEl = modal.querySelector('.note-preview-body-wrap');
   if (!bodyEl) return;
   bodyEl.innerHTML = _notePreviewContentHtml(note);
@@ -2194,7 +2238,7 @@ function _renderNotes() {
       ${_noteShareBadgeHtml(note)}
       ${noteTags.length ? `<div class="note-card-label">${noteTags.map(t => `<button type="button" class="note-card-label-chip" data-note-label-filter="${_esc(t)}" title="Filter #${_esc(t)}">#${_esc(t)}</button>`).join(' ')}</div>` : ''}
       ${note.agent_session_id ? `<button class="note-agent-tag" data-note-id="${note.id}" data-session-id="${_esc(note.agent_session_id)}" title="Open the agent's chat for this note">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/></svg>
+        ${_agentSvg(11)}
         <span>Agent</span>
       </button>` : ''}
       <div class="note-card-actions">
@@ -2850,6 +2894,8 @@ function _bindCardEvents(body) {
   body.querySelectorAll('.note-content-preview .md-task').forEach(el => {
     el.addEventListener('click', (e) => {
       if (_selectMode) return;
+      // The per-item agent button handles its own click (stops propagation);
+      // any other click on the row toggles the task.
       e.stopPropagation();
       const wrap = el.closest('.note-content-preview');
       const noteId = wrap?.dataset.noteId;
@@ -2863,6 +2909,9 @@ function _bindCardEvents(body) {
       });
     });
   });
+  // Per-item "solve with agent" buttons (PR #2747), hover-revealed on cards.
+  // Desktop-only (hover-based) and not in select mode.
+  if (!_isNotesMobileMode() && !_selectMode) _injectTaskAgentButtons(body);
 
   // Drag-reorder notes on pointer/mouse devices. Mobile uses the custom
   // placeholder sorter below `_bindLongPressDrag`; native HTML5 dragging is
@@ -4573,7 +4622,7 @@ function _openNoteCornerMenu(btn) {
     </button>
     ${shareItem}
     <button type="button" class="ncm-item" data-act="agent">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/></svg>
+      ${_agentSvg(14)}
       <span>${note.agent_session_id ? 'Re-run agent' : 'Agent: solve this'}</span>
     </button>`;
   document.body.appendChild(menu);
@@ -4613,38 +4662,37 @@ function _noteToAgentPrompt(note) {
 // Agent-solve: create a chat session server-side, kick off an agent run
 // on it IN THE BACKGROUND (the user stays in notes), and link the session
 // to the note via a clickable tag. Tapping the tag later opens the chat.
-async function _agentSolveNote(id) {
-  const note = _notes.find(n => n.id === id);
-  if (!note) return;
-  const prompt = _noteToAgentPrompt(note);
-  if (!prompt) { uiModule.showToast('Nothing to solve — note is empty'); return; }
+// Shared core for both "Agent: solve" affordances. Resolves the user's default
+// chat model, creates a session, links it to the note (latest-wins
+// agent_session_id → the Agent tag surfaces it), and runs the agent loop in the
+// background to completion. The agent run uses `mode=agent` on the default chat
+// model — there's no separate "default agent", agent is a mode of the chat.
+async function _runNoteAgent(noteId, { prompt, label, toast } = {}) {
+  if (!prompt) return;
   try {
+    // skip_validation: the default-chat endpoint is already known good.
     const dc = await (await fetch(`${API_BASE}/api/default-chat`, { credentials: 'same-origin' })).json();
     if (!dc.endpoint_url || !dc.model) { uiModule.showError('No default chat model configured'); return; }
 
-    // 1. Create the session server-side (no UI switch). skip_validation
-    //    avoids re-probing — the default-chat endpoint is already known good.
-    const label = (note.title || (Array.isArray(note.items) && note.items[0]?.text) || 'todo').slice(0, 40);
     const csFd = new FormData();
-    csFd.append('name', 'Agent: ' + label);
+    csFd.append('name', 'Agent: ' + (label || 'todo'));
     csFd.append('endpoint_url', dc.endpoint_url);
     csFd.append('model', dc.model);
     if (dc.endpoint_id) csFd.append('endpoint_id', dc.endpoint_id);
     csFd.append('skip_validation', 'true');
     const csRes = await fetch(`${API_BASE}/api/session`, { method: 'POST', credentials: 'same-origin', body: csFd });
     if (!csRes.ok) { uiModule.showError('Could not create agent session'); return; }
-    const sess = await csRes.json();
-    const sid = sess.id;
+    const sid = (await csRes.json()).id;
 
-    // 2. Link the session to the note right away so the tag appears.
-    const n = _notes.find(x => x.id === id);
+    // Link the session to the note right away so the Agent tag appears.
+    const n = _notes.find(x => x.id === noteId);
     if (n) n.agent_session_id = sid;
     _renderNotes();
-    _patchNote(id, { agent_session_id: sid }).catch(() => {});
+    _patchNote(noteId, { agent_session_id: sid }).catch(() => {});
 
-    // 3. Kick off the agent run in the background. POST to chat_stream in
-    //    agent mode and drain the SSE so the server runs the loop to
-    //    completion + saves — without rendering anything in the chat UI.
+    // Kick off the agent run in the background: POST to chat_stream in agent
+    // mode and drain the SSE so the server runs the loop to completion + saves,
+    // without rendering anything in the chat UI.
     const fd = new FormData();
     fd.append('message', prompt);
     fd.append('session', sid);
@@ -4653,18 +4701,39 @@ async function _agentSolveNote(id) {
       .then(async (res) => {
         if (!res.ok || !res.body) return;
         const reader = res.body.getReader();
-        // Drain to completion (server finishes + persists the run).
         while (true) { const { done } = await reader.read(); if (done) break; }
-        if (window.sessionModule && window.sessionModule.markStreamComplete) {
-          try { window.sessionModule.markStreamComplete(sid); } catch {}
-        }
+        try { window.sessionModule?.markStreamComplete?.(sid); } catch {}
       })
       .catch(() => {});
 
-    uiModule.showToast('Agent working in background — tap the Agent tag when ready');
+    uiModule.showToast(toast || 'Agent working in background — tap the Agent tag when ready');
   } catch (e) {
     uiModule.showError('Agent failed: ' + (e.message || e));
   }
+}
+
+// Whole-note agent solve (corner-menu "Agent: solve this").
+async function _agentSolveNote(id) {
+  const note = _notes.find(n => n.id === id);
+  if (!note) return;
+  const prompt = _noteToAgentPrompt(note);
+  if (!prompt) { uiModule.showToast('Nothing to solve — note is empty'); return; }
+  const label = (note.title || (Array.isArray(note.items) && note.items[0]?.text) || 'todo').slice(0, 40);
+  return _runNoteAgent(id, { prompt, label });
+}
+
+// Per-item agent solve (PR #2747). Scoped to a single checklist item — the note
+// title (if any) is context, but only this item's text is the work. `itemText`
+// is read live from the DOM at click time, so it always matches what the user
+// sees (no dependence on the derived `note.items` array staying in sync).
+async function _agentSolveTodoItem(noteId, itemText) {
+  const text = (itemText || '').trim();
+  if (!text) { uiModule.showToast('Nothing to solve — item is empty'); return; }
+  const titleCtx = (_notes.find(n => n.id === noteId)?.title || '').trim();
+  const prompt = titleCtx
+    ? `Context (from note "${titleCtx}").\n\nHelp me with this todo: ${text}`
+    : `Help me with this todo: ${text}`;
+  return _runNoteAgent(noteId, { prompt, label: text.slice(0, 40), toast: 'Agent working on this item — tap the Agent tag when ready' });
 }
 
 async function _copyNote(noteId, btnEl) {
@@ -4856,6 +4925,67 @@ function _openTagEditor(anchor, note) {
   render();
 }
 
+// Ask the agent a free-text question/request with this note as context (rewrite,
+// summarize, web-check, …). Runs the agent (mode=agent, so it can use tools like
+// web search) on the default chat model; the answer surfaces via the Agent tag.
+async function _askAboutNote(noteId, request) {
+  const req = (request || '').trim();
+  if (!req) return;
+  const note = _notes.find(n => n.id === noteId);
+  if (!note) return;
+  const title = (note.title || '').trim();
+  const content = (note.content || '').trim();
+  const ctx = [title ? `Note title: "${title}"` : '', content ? `Note content:\n${content}` : '']
+    .filter(Boolean).join('\n\n');
+  const prompt = ctx ? `${ctx}\n\n---\n\n${req}` : req;
+  return _runNoteAgent(noteId, {
+    prompt,
+    label: req.slice(0, 40),
+    toast: 'Agent working on your request — tap the Agent tag when ready',
+  });
+}
+
+// In-page popover to ask the agent about the note: quick suggestions + a
+// free-text box. Anchored to the footer "ask" button.
+function _openNoteAskMenu(anchor, note) {
+  document.querySelectorAll('.note-reminder-menu, .note-share-menu, .note-img-menu, .note-tag-menu, .note-ask-menu').forEach(m => m.remove());
+  const menu = document.createElement('div');
+  menu.className = 'note-reminder-menu note-ask-menu';
+  const suggestions = ['Rewrite this more clearly', 'Summarize this note', 'Fix spelling & grammar', 'Search the web about this'];
+  menu.innerHTML = `<div class="note-reminder-menu-title">Ask the agent about this note</div>
+    <div class="note-ask-body">
+      <div class="note-ask-suggest">${suggestions.map(s => `<button type="button" class="note-ask-chip">${_esc(s)}</button>`).join('')}</div>
+      <textarea class="note-ask-input" rows="2" placeholder="Ask anything — e.g. rewrite this, check the web for…" spellcheck="true"></textarea>
+      <button type="button" class="note-ask-send">Ask agent</button>
+    </div>`;
+  document.body.appendChild(menu);
+  _positionPopover(menu, anchor);
+
+  const close = () => { menu.remove(); document.removeEventListener('mousedown', onDoc, true); };
+  const onDoc = (e) => { if (!menu.contains(e.target) && e.target !== anchor) close(); };
+  setTimeout(() => document.addEventListener('mousedown', onDoc, true), 0);
+
+  const submit = (txt) => {
+    const r = (txt || '').trim();
+    if (!r) return;
+    _askAboutNote(note.id, r);
+    close();
+  };
+  const input = menu.querySelector('.note-ask-input');
+  menu.querySelector('.note-ask-send').addEventListener('click', () => submit(input.value));
+  menu.querySelectorAll('.note-ask-chip').forEach(c => {
+    c.addEventListener('mousedown', (e) => e.preventDefault());
+    c.addEventListener('click', () => submit(c.textContent));
+  });
+  // Enter submits, Shift+Enter inserts a newline. Don't leak keys to the panel.
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(input.value); }
+    else if (e.key === 'Escape') close();
+  });
+  input.focus();
+}
+
 // Editing controls for the preview footer: color dots, add-tag, archive, delete.
 // Hidden entirely for a view-only collaborator (can_edit === false). Archive and
 // delete are owner-only; color/tag are available to edit collaborators too.
@@ -4865,12 +4995,18 @@ function _notePreviewActionsHtml(note) {
   const colorDots = COLORS.map(c =>
     `<span class="note-preview-color-dot${_dotIsActive(c.value, note.color) ? ' active' : ''}" data-color="${c.value}" style="background:${_dotBg(c.value, note.color)}" title="${c.name || 'default'}"></span>`
   ).join('');
+  // Open the agent's chat for this note — only when a run has been linked.
+  const agentChatBtn = note.agent_session_id
+    ? `<button type="button" class="note-preview-act note-preview-act-agent" data-act="agentchat" title="Open the agent's chat for this note">${_agentSvg(15)}</button>`
+    : '';
+  // Ask the agent about this note (free-text: rewrite, summarize, web-check…).
+  const askBtn = `<button type="button" class="note-preview-act" data-act="ask" title="Ask the agent about this note"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg></button>`;
   const tagBtn = `<button type="button" class="note-preview-act" data-act="tag" title="Add tag"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41 13.42 20.58a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></button>`;
   const archiveBtn = isOwner ? `<button type="button" class="note-preview-act" data-act="archive" title="${note.archived ? 'Unarchive' : 'Archive'}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg></button>` : '';
   const deleteBtn = isOwner ? `<button type="button" class="note-preview-act note-preview-act-danger" data-act="delete" title="Delete note"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>` : '';
   return `<div class="note-preview-colors">${colorDots}</div>
     <span class="note-preview-actions-spacer"></span>
-    ${tagBtn}${archiveBtn}${deleteBtn}`;
+    ${agentChatBtn}${askBtn}${tagBtn}${archiveBtn}${deleteBtn}`;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -5215,7 +5351,7 @@ function _bindPreviewChecklist(container) {
     // stops the caret/focus from landing in the editor; the click below still
     // fires and toggles the item.
     bodyEl.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('.md-task-box, .md-img')) e.preventDefault();
+      if (e.target.closest('.md-task-box, .md-img, .md-task-agent')) e.preventDefault();
     });
     // Tap an embedded image → resize / remove menu.
     bodyEl.addEventListener('click', (e) => {
@@ -5224,6 +5360,11 @@ function _bindPreviewChecklist(container) {
       e.preventDefault();
       _openPreviewImageMenu(img, bodyEl);
     });
+    // Per-item "solve with agent" buttons (PR #2747) inside the editor. The
+    // serializer reads only `.md-task-text`, so these contenteditable=false
+    // siblings never land in the saved markdown. (Each button wires its own
+    // click via _makeTaskAgentBtn.)
+    _injectTaskAgentButtons(bodyEl);
     // Toggle a checkbox by clicking its box (the box is contenteditable=false).
     bodyEl.addEventListener('click', (e) => {
       const box = e.target.closest('.md-task-box');
@@ -5468,7 +5609,17 @@ function _openNotePreview(id, opts = {}) {
       }
       const actBtn = e.target.closest('[data-act]');
       const act = actBtn?.dataset.act;
-      if (act === 'tag') {
+      if (act === 'agentchat') {
+        const n = _notes.find(x => x.id === id);
+        const sid = n?.agent_session_id;
+        const _sm = window.sessionModule;
+        if (sid && _sm && _sm.selectSession) { closeFn(); closePanel(); _sm.selectSession(sid); }
+      }
+      else if (act === 'ask') {
+        const n = _notes.find(x => x.id === id);
+        if (n) _openNoteAskMenu(actBtn, n);
+      }
+      else if (act === 'tag') {
         const n = _notes.find(x => x.id === id);
         if (n) _openTagEditor(actBtn, n);
       }

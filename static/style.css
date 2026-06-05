@@ -30732,9 +30732,25 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
 /* Mobile: the preview is the only editor, so give it a near-fullscreen sheet
    instead of a small floating window. */
 @media (max-width: 768px) {
+  /* Fullscreen sheet: drop the bottom-sheet safe-area gap so it reaches the
+     bottom edge — the inset is moved onto the footer below instead. */
+  #note-preview-modal {
+    padding-bottom: 0;
+  }
   #note-preview-modal .note-preview-modal-content {
-    width: 96vw;
-    max-height: 90vh;
+    /* True fullscreen sheet. `align-self: stretch` fills the modal's available
+       height. The generic mobile `.modal-content` sets `max-height: 85vh
+       !important` (which was capping us → ~15vh bottom gap), so override it with
+       !important here. width:100vw + no radius = edge-to-edge. */
+    width: 100vw;
+    align-self: stretch;
+    max-height: none !important;
+    border-radius: 0;
+  }
+  /* Keep the footer actions clear of the home indicator now that the modal's
+     own bottom padding is gone. */
+  #note-preview-modal .note-preview-actions {
+    padding-bottom: calc(9px + env(safe-area-inset-bottom, 0px));
   }
   /* iOS Safari auto-zooms when a focused text field is < 16px. Bump every
      editable surface in the notes UI to 16px on mobile so focusing one (the
@@ -30823,6 +30839,37 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
 .md-task[data-done="1"] .md-task-text {
   text-decoration: line-through;
   opacity: 0.5;
+}
+/* Per-item "solve with agent" button (PR #2747), injected on card checklist
+   items. Hover-revealed at the row's right edge — mirrors the per-note Agent
+   affordance, reuses --fg / --accent and the existing fade lifecycle. */
+.md-task-agent {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-left: 4px;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  opacity: 0;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.md-task:hover .md-task-agent { opacity: 0.55; }
+.md-task-agent:hover {
+  opacity: 1 !important;
+  color: var(--accent, var(--red));
+  background: color-mix(in srgb, var(--accent, var(--red)) 12%, transparent);
+}
+.note-card-selectmode .md-task-agent { display: none; }
+/* In the preview editor on touch devices there's no hover, so keep the per-item
+   agent button gently visible (it's the main editor on mobile). */
+@media (hover: none) {
+  .note-preview-body .md-task-agent { opacity: 0.5; }
 }
 /* Touch devices: the checkbox is the only toggle target in the preview editor
    (tapping the text edits it), and 18px is a hard thumb target. Extend the box's
@@ -31855,6 +31902,13 @@ input.note-preview-title::placeholder { opacity: 0.4; }
   background: color-mix(in srgb, var(--red, #e0607e) 14%, transparent);
   color: var(--red, #e0607e);
 }
+/* "Open agent chat" — only shown once a run is linked; tinted so it reads as
+   the way back to the agent's work. */
+.note-preview-act-agent { color: var(--accent, var(--red, #e0607e)); }
+.note-preview-act-agent:hover {
+  background: color-mix(in srgb, var(--accent, var(--red, #e0607e)) 14%, transparent);
+  color: var(--accent, var(--red, #e0607e));
+}
 
 /* In-page tag editor popover. */
 .note-tag-menu { min-width: 230px; max-width: 300px; padding: 8px 0 4px; }
@@ -31906,6 +31960,39 @@ input.note-preview-title::placeholder { opacity: 0.4; }
   border-color: color-mix(in srgb, var(--accent, var(--red)) 35%, var(--border));
   color: var(--accent, var(--red));
 }
+
+/* "Ask the agent about this note" popover. */
+.note-ask-menu { min-width: 260px; max-width: 320px; padding: 8px 0 4px; }
+.note-ask-body { padding: 4px 12px 8px; display: flex; flex-direction: column; gap: 8px; }
+.note-ask-suggest { display: flex; flex-wrap: wrap; gap: 5px; }
+.note-ask-chip {
+  font: inherit; font-size: 11px;
+  padding: 3px 9px; border-radius: 999px; cursor: pointer;
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+  border: 1px solid var(--border);
+  color: color-mix(in srgb, var(--fg) 72%, transparent);
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.note-ask-chip:hover {
+  background: color-mix(in srgb, var(--accent, var(--red)) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent, var(--red)) 35%, var(--border));
+  color: var(--accent, var(--red));
+}
+.note-ask-input {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 44px;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  border: 1px solid var(--border); border-radius: 5px;
+  color: var(--fg); font: inherit; font-size: 12px; line-height: 1.4;
+  padding: 7px 8px; outline: none;
+}
+.note-ask-input:focus { border-color: var(--accent, var(--red)); }
+.note-ask-send {
+  align-self: flex-end;
+  background: var(--accent, var(--red)); color: #fff; border: none;
+  border-radius: 5px; padding: 6px 14px;
+  font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.note-ask-send:hover { filter: brightness(1.08); }
 .note-reminder-menu-confirm {
   font-weight: 600;
   color: var(--accent);
