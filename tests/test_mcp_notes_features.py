@@ -77,6 +77,16 @@ def test_manage_notes_covers_every_feature(monkeypatch):
         r = call(action="toggle_item", id=nid, index=99)
         assert r.get("error") and "exit_code" in r
 
+        # 4b) due_date (the reminder field) round-trips on add and update. The
+        # tool parses natural language / ISO; we only assert it persists and the
+        # updated value sticks (exact tz-normalized form is environment-specific).
+        r = call(action="add", title="Dentist", content="Cleaning", due_date="2026-07-01T09:00")
+        did = r["response"].split("id: ")[1].rstrip(")")
+        assert fetch(did).due_date, "due_date should persist on add"
+        call(action="update", id=did, due_date="2026-08-15T14:30")
+        assert "2026-08" in (fetch(did).due_date or ""), "due_date should update"
+        call(action="delete", id=did)
+
         # 5) checklist_items (legacy) folds into a note that has NO task lines yet.
         r2 = call(action="add", title="Beach", content="What to bring:")
         bid = r2["response"].split("id: ")[1].rstrip(")")

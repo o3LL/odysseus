@@ -310,6 +310,25 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                         .filter(func.lower(model.owner) == old_username)
                         .update({"owner": new_username}, synchronize_session=False)
                     )
+                # NoteShare is keyed by `shared_with` (a username), not `owner`,
+                # so the loop above misses it. Re-point shares granted to the
+                # renamed user; if a share to the new name already exists for the
+                # same note, drop the old row instead of violating the unique
+                # (note_id, shared_with) constraint. Without this the old share is
+                # orphaned and re-sharing creates a duplicate "second person".
+                from core.database import NoteShare
+                taken = {
+                    nid for (nid,) in db.query(NoteShare.note_id)
+                    .filter(func.lower(NoteShare.shared_with) == new_username).all()
+                }
+                for row in (
+                    db.query(NoteShare)
+                    .filter(func.lower(NoteShare.shared_with) == old_username).all()
+                ):
+                    if row.note_id in taken:
+                        db.delete(row)
+                    else:
+                        row.shared_with = new_username
                 db.commit()
             except Exception:
                 db.rollback()

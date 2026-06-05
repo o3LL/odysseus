@@ -560,14 +560,16 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_notes",
-            "description": "Manage notes (Apple-Notes-style): list, add, update, delete, toggle_item. A note is a single markdown document in `content` — there is ONE note type. To include a checklist, write GitHub-style task lines directly in `content`: `- [ ] buy milk` for an open item and `- [x] call dentist` for a done one. To embed an image, use markdown image syntax `![caption](https://…)` (any http(s) URL or an Odysseus /api/upload/<id> URL) — it renders inline in the note. Text, checklists, and images can be freely mixed in the same note (e.g. a heading, a paragraph, an image, then task lines). Checklists render as interactive checkboxes the user can tap. `due_date` accepts natural language like 'tomorrow at 9am' (parsed in the user's timezone) and fires a notification — do not also create a calendar event for the same reminder.",
+            "description": "Manage notes (Apple-Notes-style): list, add, update, delete, toggle_item, share, unshare. A note is a single markdown document in `content` — there is ONE note type. To include a checklist, write GitHub-style task lines directly in `content`: `- [ ] buy milk` for an open item and `- [x] call dentist` for a done one. To embed an image, use markdown image syntax `![caption](https://…)` (any http(s) URL or an Odysseus /api/upload/<id> URL) — it renders inline in the note. Text, checklists, and images can be freely mixed in the same note (e.g. a heading, a paragraph, an image, then task lines). Checklists render as interactive checkboxes the user can tap. `due_date` accepts natural language like 'tomorrow at 9am' (parsed in the user's timezone) and fires a notification — do not also create a calendar event for the same reminder. Notes are private by default; use `share` (with `users`) to let other accounts view and edit a note, and `unshare` to revoke. `list` includes notes shared with you, tagged with their owner.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["list", "add", "update", "delete", "toggle_item"],
-                               "description": "The action to perform"},
-                    "id": {"type": "string", "description": "Note id (for update/delete/toggle_item); 8-char prefix is fine"},
+                               "enum": ["list", "get", "add", "update", "delete", "toggle_item", "share", "unshare"],
+                               "description": "The action to perform. `list` summarises notes (content truncated); `get` returns one note's full content + metadata + sharing (pass `id`)."},
+                    "id": {"type": "string", "description": "Note id (for update/delete/toggle_item/share/unshare); 8-char prefix is fine"},
+                    "users": {"type": "array", "items": {"type": "string"},
+                              "description": "Usernames to share with (for share) or revoke (for unshare). Only the note's owner can share."},
                     "title": {"type": "string", "description": "Note title (for add/update)"},
                     "content": {"type": "string", "description": "The note body as markdown. Put checklist items here as task lines: `- [ ] todo` (open) / `- [x] done`. Indent with two spaces per level for sub-items. Embed images with `![](https://…)`. Example: 'Groceries for dinner\\n- [ ] Milk\\n- [x] Bread\\n\\n![receipt](https://example.com/r.jpg)'."},
                     "checklist_items": {"type": "array",

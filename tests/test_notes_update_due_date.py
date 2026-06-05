@@ -55,6 +55,7 @@ def _install_fakes(monkeypatch, note, parse=None):
     fake_core_db = types.ModuleType("core.database")
     fake_core_db.SessionLocal = lambda: FakeDB()
     fake_core_db.Note = MagicMock()  # only used as a query/filter argument
+    fake_core_db.NoteShare = MagicMock()  # sharing model (imported by do_manage_notes)
     monkeypatch.setitem(sys.modules, "core.database", fake_core_db)
 
     calls = {"parsed": []}

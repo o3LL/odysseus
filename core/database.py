@@ -993,6 +993,47 @@ def _migrate_unify_notes():
     except Exception as e:
         log.warning(f"notes unify migration skipped: {e}")
 
+def _migrate_fold_image_url():
+    """Fold the legacy single `image_url` attachment into `content` as a markdown
+    image, so notes have ONE image system (inline `![](url)`) instead of two.
+
+    Idempotent: once `image_url` is NULL there is nothing left to fold. Skips
+    appending if the URL is already embedded in content (defensive).
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    log = logging.getLogger(__name__)
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(notes)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if not columns or "image_url" not in columns:
+            conn.close()
+            return
+        rows = conn.execute(
+            "SELECT id, content, image_url FROM notes WHERE image_url IS NOT NULL AND image_url != ''"
+        ).fetchall()
+        folded = 0
+        for note_id, content, image_url in rows:
+            content = content or ""
+            if image_url not in content:
+                img_md = f"![]({image_url})"
+                content = (content.rstrip() + "\n\n" + img_md) if content.strip() else img_md
+            conn.execute(
+                "UPDATE notes SET content = ?, image_url = NULL WHERE id = ?",
+                (content, note_id),
+            )
+            folded += 1
+        conn.commit()
+        conn.close()
+        if folded:
+            log.info(f"Migrated: folded {folded} note image attachment(s) into markdown content")
+    except Exception as e:
+        log.warning(f"notes image-url fold migration skipped: {e}")
+
+
 def _migrate_add_mode_column():
     """Add mode column to sessions table if it doesn't exist."""
     import sqlite3
@@ -1510,6 +1551,26 @@ class Note(TimestampMixin, Base):
     agent_session_id  = Column(String, nullable=True)
 
 
+class NoteShare(TimestampMixin, Base):
+    """A grant giving another user access to a note.
+
+    The note's `owner` always retains full control (edit/delete/share). Each row
+    here grants one other user (`shared_with`) access at `permission` level.
+    Access is strictly explicit: a user can read/write a note only if they own
+    it OR a NoteShare row names them. See routes/note_routes.py `_note_access`.
+    """
+    __tablename__ = "note_shares"
+
+    id          = Column(String, primary_key=True, index=True)
+    note_id     = Column(String, ForeignKey("notes.id"), nullable=False, index=True)
+    shared_with = Column(String, nullable=False, index=True)   # username
+    permission  = Column(String, nullable=False, default="edit")  # 'edit' | 'view'
+
+    __table_args__ = (
+        Index("ix_note_shares_note_user", "note_id", "shared_with", unique=True),
+    )
+
+
 class CalendarCal(TimestampMixin, Base):
     """A calendar (e.g. 'Personal', 'TimeTree')."""
     __tablename__ = "calendars"
@@ -1656,6 +1717,7 @@ def init_db():
     _migrate_add_pinned_models_column()
     _migrate_add_notes_sort_order()
     _migrate_unify_notes()
+    _migrate_fold_image_url()
     _migrate_add_model_type_column()
     _migrate_add_model_endpoint_refresh_columns()
     _migrate_add_model_endpoint_owner_column()

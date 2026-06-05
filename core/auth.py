@@ -28,6 +28,9 @@ DEFAULT_PRIVILEGES = {
     "can_use_research": True,
     "can_generate_images": True,
     "can_manage_memory": True,
+    # Share notes with other accounts (and enumerate share targets). Defaults
+    # on so existing behaviour is unchanged; an admin can revoke it per user.
+    "can_share_notes": True,
     "max_messages_per_day": 0,
     "allowed_models": [],
     "allowed_models_restricted": False,

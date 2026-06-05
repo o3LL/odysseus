@@ -501,8 +501,17 @@ export function mdToHtml(src, opts) {
     const safe = safeImageUrl(url);
     if (!safe) return escapeHtml(alt || '');
     const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
-    const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-    allowedHtmlBlocks.push(`<img class="md-img" src="${escapeHtml(safe)}" alt="${escapeHtml(alt || '')}"${titleAttr} loading="lazy">`);
+    // A title of the form "w=NN" carries a display width (percentage) set by the
+    // image resize control; anything else is a real title tooltip.
+    let widthAttr = '', titleAttr = '';
+    const wm = title && /^\s*w=(\d{1,3})\s*$/.exec(title);
+    if (wm) {
+      const w = Math.max(5, Math.min(100, parseInt(wm[1], 10)));
+      widthAttr = ` style="width:${w}%"`;
+    } else if (title) {
+      titleAttr = ` title="${escapeHtml(title)}"`;
+    }
+    allowedHtmlBlocks.push(`<img class="md-img" src="${escapeHtml(safe)}" alt="${escapeHtml(alt || '')}"${widthAttr}${titleAttr} loading="lazy">`);
     return placeholder;
   });
 

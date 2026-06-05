@@ -1801,7 +1801,7 @@ async def do_api_call(content: str) -> Dict:
 async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
     """Handle manage_notes tool calls: CRUD on notes and checklists."""
     import uuid as _uuid
-    from core.database import SessionLocal, Note
+    from core.database import SessionLocal, Note, NoteShare
     from core.notes_markdown import merge_items_into_content, parse_task_lines, toggle_task
 
     try:
@@ -1819,6 +1819,10 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
         "remind": "add",
         "remove": "delete",
         "remove_item": "toggle_item",
+        "read": "get",
+        "view": "get",
+        "show": "get",
+        "open": "get",
     }
     action = _NOTE_ACTION_ALIASES.get(action, action)
     db = SessionLocal()
@@ -1828,25 +1832,63 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
         text = re.sub(r"^\s*reminder\s*:\s*", "", text)
         return re.sub(r"\s+", " ", text)
 
+    def _note_caps(note) -> set:
+        """Capabilities the acting `owner` has on `note` (mirrors the REST
+        _note_access): owner gets everything, an 'edit' collaborator gets
+        read+write, 'view' gets read, otherwise nothing."""
+        if owner is None or note.owner == owner:
+            return {"read", "write", "delete", "share"}
+        sh = (
+            db.query(NoteShare)
+            .filter(NoteShare.note_id == note.id, NoteShare.shared_with == owner)
+            .first()
+        )
+        if not sh:
+            return set()
+        return {"read"} if sh.permission == "view" else {"read", "write"}
+
     try:
         if action == "list":
+            show_archived = args.get("archived", False)
             q = db.query(Note)
             if owner is not None:
                 q = q.filter(Note.owner == owner)
             if args.get("label"):
                 q = q.filter(Note.label == args["label"])
-            show_archived = args.get("archived", False)
             q = q.filter(Note.archived == show_archived)
             notes = q.order_by(Note.pinned.desc(), Note.updated_at.desc()).all()
+            # Notes shared with this user (not owned by them).
+            shared_ids = set()
+            if owner is not None:
+                shared_ids = {
+                    s.note_id for s in db.query(NoteShare).filter(NoteShare.shared_with == owner).all()
+                }
+                if shared_ids:
+                    sq = db.query(Note).filter(Note.id.in_(shared_ids), Note.owner != owner,
+                                               Note.archived == show_archived)
+                    if args.get("label"):
+                        sq = sq.filter(Note.label == args["label"])
+                    notes = notes + sq.order_by(Note.updated_at.desc()).all()
             if not notes:
                 return {"response": "No notes found.", "exit_code": 0}
+            # Map each owned note id -> collaborator usernames (for the owner's view).
+            collab = {}
+            if owner is not None and notes:
+                for s in db.query(NoteShare).filter(NoteShare.note_id.in_([n.id for n in notes])).all():
+                    collab.setdefault(s.note_id, []).append(s.shared_with)
             lines = []
             for n in notes:
                 pin = " [PINNED]" if n.pinned else ""
                 tasks = parse_task_lines(n.content)
                 lbl = f" #{n.label}" if n.label else ""
                 title = n.title or "(untitled)"
-                lines.append(f"- [{n.id[:8]}] **{title}**{pin}{lbl}")
+                if owner is not None and n.owner != owner:
+                    share_tag = f" [shared by {n.owner}]"
+                elif n.id in collab:
+                    share_tag = f" [shared with {', '.join(sorted(collab[n.id]))}]"
+                else:
+                    share_tag = ""
+                lines.append(f"- [{n.id[:8]}] **{title}**{pin}{lbl}{share_tag}")
                 if tasks:
                     # Show the checklist with its toggle indices.
                     for t in tasks:
@@ -1855,6 +1897,44 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
                 elif n.content:
                     snippet = n.content[:80].replace("\n", " ")
                     lines.append(f"  {snippet}")
+            return {"results": "\n".join(lines)}
+
+        elif action == "get":
+            # Read one note in full (content isn't truncated like `list`).
+            note_id = args.get("id", "")
+            note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
+            if not note:
+                return {"error": f"Note '{note_id}' not found", "exit_code": 1}
+            if "read" not in _note_caps(note):
+                return {"error": "Note not found", "exit_code": 1}
+            tasks = parse_task_lines(note.content)
+            meta = []
+            if note.label:
+                meta.append(f"#{note.label}")
+            if note.due_date:
+                meta.append(f"due {note.due_date}")
+            if note.repeat and note.repeat != "none":
+                meta.append(f"repeats {note.repeat}")
+            if note.pinned:
+                meta.append("pinned")
+            if note.archived:
+                meta.append("archived")
+            if owner is not None and note.owner != owner:
+                meta.append(f"shared by {note.owner}")
+            else:
+                shares = db.query(NoteShare).filter(NoteShare.note_id == note.id).all()
+                if shares:
+                    meta.append("shared with " + ", ".join(f"{s.shared_with} ({s.permission})" for s in shares))
+            lines = [f"**{note.title or '(untitled)'}**  [{note.id[:8]}]"]
+            if meta:
+                lines.append("_" + " · ".join(meta) + "_")
+            lines.append("")
+            lines.append(note.content or "(empty)")
+            if tasks:
+                lines.append("")
+                lines.append("Checklist items (toggle_item by index):")
+                for t in tasks:
+                    lines.append(f"  [{'x' if t['done'] else ' '}] {t['index']}: {t['text']}")
             return {"results": "\n".join(lines)}
 
         elif action == "add":
@@ -1947,7 +2027,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
-            if owner is not None and note.owner and note.owner != owner:
+            if "write" not in _note_caps(note):
                 return {"error": "Note not found", "exit_code": 1}
             for field in ("title", "content", "color", "label"):
                 if field in args and args[field] is not None:
@@ -1984,9 +2064,10 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
-            if owner is not None and note.owner and note.owner != owner:
+            if "delete" not in _note_caps(note):
                 return {"error": "Note not found", "exit_code": 1}
             title = note.title
+            db.query(NoteShare).filter(NoteShare.note_id == note.id).delete()
             db.delete(note)
             db.commit()
             return {"response": f"Deleted note: \"{title or '(untitled)'}\"", "exit_code": 0}
@@ -1997,7 +2078,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
-            if owner is not None and note.owner and note.owner != owner:
+            if "write" not in _note_caps(note):
                 return {"error": "Note not found", "exit_code": 1}
             try:
                 new_content, item = toggle_task(note.content, int(index))
@@ -2009,8 +2090,67 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             mark = "done" if item["done"] else "undone"
             return {"response": f"Item '{item['text']}' marked {mark}", "exit_code": 0}
 
+        elif action in ("share", "unshare"):
+            note_id = args.get("id", "")
+            note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
+            if not note:
+                return {"error": f"Note '{note_id}' not found", "exit_code": 1}
+            if "share" not in _note_caps(note):
+                return {"error": "Only the note's owner can share it", "exit_code": 1}
+            targets = args.get("users") or args.get("user") or []
+            if isinstance(targets, str):
+                targets = [targets]
+            targets = [(u or "").strip().lower() for u in targets if (u or "").strip()]
+            if not targets:
+                return {"error": "Provide one or more usernames in `users`", "exit_code": 1}
+            # Validate against real accounts when an auth config is present, and
+            # gate `share` on the can_share_notes privilege (mirrors the REST
+            # route). `unshare`/leave is always allowed.
+            valid = None
+            try:
+                from core.auth import AuthManager
+                _am = AuthManager()
+                valid = set((_am.users or {}).keys())
+                if action == "share" and owner and not _am.get_privileges(owner).get("can_share_notes", True):
+                    return {"error": "Your account is not allowed to share notes", "exit_code": 1}
+            except Exception:
+                valid = None
+            perm = "view" if (args.get("permission") == "view") else "edit"
+            changed = []
+            for uname in targets:
+                if uname == (note.owner or ""):
+                    continue
+                if action == "share":
+                    if valid is not None and uname not in valid:
+                        continue
+                    existing = (
+                        db.query(NoteShare)
+                        .filter(NoteShare.note_id == note.id, NoteShare.shared_with == uname)
+                        .first()
+                    )
+                    if existing:
+                        existing.permission = perm
+                    else:
+                        db.add(NoteShare(id=str(_uuid.uuid4()), note_id=note.id,
+                                         shared_with=uname, permission=perm))
+                    changed.append(uname)
+                else:  # unshare
+                    n = (
+                        db.query(NoteShare)
+                        .filter(NoteShare.note_id == note.id, NoteShare.shared_with == uname)
+                        .delete()
+                    )
+                    if n:
+                        changed.append(uname)
+            db.commit()
+            shares = db.query(NoteShare).filter(NoteShare.note_id == note.id).all()
+            who = ", ".join(s.shared_with for s in shares) or "(nobody)"
+            verb = "Shared with" if action == "share" else "Unshared from"
+            return {"response": f"{verb} {', '.join(changed) or '(no change)'}. Now shared with: {who}",
+                    "exit_code": 0}
+
         else:
-            return {"error": f"Unknown action: {action}. Use list/add/update/delete/toggle_item", "exit_code": 1}
+            return {"error": f"Unknown action: {action}. Use list/get/add/update/delete/toggle_item/share/unshare", "exit_code": 1}
     except Exception as e:
         logger.error(f"manage_notes error: {e}")
         return {"error": str(e), "exit_code": 1}

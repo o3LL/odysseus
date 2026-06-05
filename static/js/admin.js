@@ -27,6 +27,7 @@ const PRIV_LABELS = {
   can_use_research: 'Deep research',
   can_generate_images: 'Image generation',
   can_manage_memory: 'Memory & skills',
+  can_share_notes: 'Share notes',
 };
 
 async function loadUsers() {

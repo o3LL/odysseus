@@ -9,9 +9,9 @@ from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from core.database import SessionLocal, Note
+from core.database import SessionLocal, Note, NoteShare
 from core.notes_markdown import parse_task_lines, toggle_task, merge_items_into_content
-from src.auth_helpers import get_current_user
+from src.auth_helpers import get_current_user, require_privilege
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,11 @@ class NoteCreate(BaseModel):
     sort_order: Optional[int] = None
 
 
+class NoteShareRequest(BaseModel):
+    users: list = []                       # usernames to grant access to
+    permission: Optional[str] = "edit"     # 'edit' (default) | 'view'
+
+
 class NoteUpdate(BaseModel):
     title: Optional[str] = None
     content: Optional[str] = None           # markdown; checklists are task lines
@@ -60,7 +65,36 @@ class NoteUpdate(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _note_to_dict(note: Note) -> Dict[str, Any]:
+def _note_access(request: Request, db, note: Note, user: Optional[str]) -> set:
+    """Capabilities a `user` has on `note`: subset of {read, write, delete, share}.
+
+    The single source of truth for note authorization. Access is strictly
+    explicit — a user gets nothing unless they own the note or a NoteShare row
+    names them. An 'edit' collaborator gets read+write; 'view' gets read only.
+
+    `user is None` is the single-user / auth-disabled path and gets full access
+    — but only when auth is NOT configured. In a configured multi-user
+    deployment a None user (e.g. an auth-middleware regression) must fail closed
+    rather than receive blanket owner access to every note.
+    """
+    if user is None:
+        auth_mgr = getattr(request.app.state, "auth_manager", None)
+        if auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
+            return set()
+        return {"read", "write", "delete", "share"}
+    if note.owner == user:
+        return {"read", "write", "delete", "share"}
+    share = (
+        db.query(NoteShare)
+        .filter(NoteShare.note_id == note.id, NoteShare.shared_with == user)
+        .first()
+    )
+    if not share:
+        return set()
+    return {"read"} if share.permission == "view" else {"read", "write"}
+
+
+def _note_to_dict(note: Note, user: Optional[str] = None, shares=None) -> Dict[str, Any]:
     # `items` is derived from the markdown task lines in `content` (the source of
     # truth). Returned for backward compatibility so older API/MCP consumers that
     # read a structured checklist still see it; shape is {text, done, indent}.
@@ -73,9 +107,21 @@ def _note_to_dict(note: Note) -> Dict[str, Any]:
             ai_cls = json.loads(raw_ai)
         except (json.JSONDecodeError, TypeError):
             ai_cls = None
+    # Sharing surface. `shares` (NoteShare rows for this note) is passed in by
+    # callers that batch-loaded them; default to no collaborators.
+    shares = shares or []
+    is_owner = user is None or note.owner == user
+    my_perm = next((s.permission for s in shares if s.shared_with == user), None)
     return {
         "id": note.id,
         "owner": note.owner,
+        "is_owner": is_owner,
+        # Who this note was shared by (the owner) when you're not the owner.
+        "shared_by": None if is_owner else note.owner,
+        # Collaborators (meaningful to the owner): [{username, permission}].
+        "shared_with": [{"username": s.shared_with, "permission": s.permission} for s in shares],
+        "is_shared": len(shares) > 0,
+        "can_edit": is_owner or my_perm == "edit",
         "title": note.title,
         "content": note.content,
         "items": items,
@@ -555,21 +601,56 @@ def setup_note_routes(task_scheduler=None):
         user = _owner(request)
         db = SessionLocal()
         try:
-            q = db.query(Note)
+            want_archived = bool(archived) if archived is not None else False
+
+            def _scope(q):
+                q = q.filter(Note.archived == want_archived)
+                if label:
+                    q = q.filter(Note.label == label)
+                return q
+
+            # Notes I own.
+            owned_q = db.query(Note)
             if user is not None:
-                q = q.filter(Note.owner == user)
-            if archived is not None:
-                q = q.filter(Note.archived == archived)
+                owned_q = owned_q.filter(Note.owner == user)
+            owned_q = _scope(owned_q)
+            if want_archived:
+                owned = owned_q.order_by(Note.updated_at.desc()).all()
             else:
-                q = q.filter(Note.archived == False)
-            if label:
-                q = q.filter(Note.label == label)
-            # Archived view: most recently archived first. Active view: pin + manual order.
-            if archived is True:
-                notes = q.order_by(Note.updated_at.desc()).all()
-            else:
-                notes = q.order_by(Note.pinned.desc(), Note.sort_order.asc(), Note.updated_at.desc()).all()
-            return {"notes": [_note_to_dict(n) for n in notes]}
+                owned = owned_q.order_by(Note.pinned.desc(), Note.sort_order.asc(), Note.updated_at.desc()).all()
+
+            # Notes shared with me (only when authenticated — no sharing in
+            # single-user mode, where `user is None` already sees everything).
+            shared = []
+            if user is not None:
+                shared_ids = [
+                    s.note_id for s in db.query(NoteShare).filter(NoteShare.shared_with == user).all()
+                ]
+                if shared_ids:
+                    shared = _scope(
+                        db.query(Note).filter(Note.id.in_(shared_ids), Note.owner != user)
+                    ).order_by(Note.updated_at.desc()).all()
+
+            notes = owned + shared
+            # Batch-load collaborators for every returned note so the owner can
+            # see who a note is shared with without N extra queries.
+            shares_by_note: Dict[str, list] = {}
+            if notes:
+                ids = [n.id for n in notes]
+                # Hide shares to usernames that no longer exist (e.g. left over
+                # from a pre-fix rename/delete) so a stale row can't show as a
+                # phantom extra collaborator. Only filters when auth is
+                # configured (single-user mode has no real user roster).
+                auth_mgr = getattr(request.app.state, "auth_manager", None)
+                valid = set((getattr(auth_mgr, "users", {}) or {}).keys()) if auth_mgr else set()
+                for s in db.query(NoteShare).filter(NoteShare.note_id.in_(ids)).all():
+                    if valid and s.shared_with not in valid:
+                        continue
+                    shares_by_note.setdefault(s.note_id, []).append(s)
+            return {
+                "notes": [_note_to_dict(n, user=user, shares=shares_by_note.get(n.id)) for n in notes],
+                "me": user,  # the viewing username (for "leave shared note")
+            }
         finally:
             db.close()
 
@@ -602,9 +683,21 @@ def setup_note_routes(task_scheduler=None):
             db.add(note)
             db.commit()
             db.refresh(note)
-            return _note_to_dict(note)
+            return _note_to_dict(note, user=user)
         finally:
             db.close()
+
+    # --- SHARE TARGETS ---
+    # Declared BEFORE GET /{note_id} so the literal path isn't swallowed by the
+    # note-id param route. Gated behind the can_share_notes privilege so the
+    # user roster (usernames are PII/emails) isn't enumerable by accounts that
+    # aren't allowed to share. Returns usernames only — never privileges/secrets.
+    @router.get("/share-targets")
+    def share_targets(request: Request):
+        user = require_privilege(request, "can_share_notes")
+        auth_mgr = getattr(request.app.state, "auth_manager", None)
+        names = sorted((getattr(auth_mgr, "users", {}) or {}).keys()) if auth_mgr else []
+        return {"users": [{"username": n} for n in names if n != (user or "")]}
 
     # --- GET ONE ---
     @router.get("/{note_id}")
@@ -615,11 +708,10 @@ def setup_note_routes(task_scheduler=None):
             note = db.query(Note).filter(Note.id == note_id).first()
             if not note:
                 raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
+            if "read" not in _note_access(request, db, note, user):
                 raise HTTPException(404, "Note not found")
-            return _note_to_dict(note)
+            shares = db.query(NoteShare).filter(NoteShare.note_id == note.id).all()
+            return _note_to_dict(note, user=user, shares=shares)
         finally:
             db.close()
 
@@ -632,9 +724,9 @@ def setup_note_routes(task_scheduler=None):
             note = db.query(Note).filter(Note.id == note_id).first()
             if not note:
                 raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
+            # Owner or an 'edit' collaborator may write; everyone else gets the
+            # same 404 as a non-existent note (don't reveal it exists).
+            if "write" not in _note_access(request, db, note, user):
                 raise HTTPException(404, "Note not found")
 
             if body.title is not None:
@@ -670,7 +762,8 @@ def setup_note_routes(task_scheduler=None):
 
             db.commit()
             db.refresh(note)
-            return _note_to_dict(note)
+            shares = db.query(NoteShare).filter(NoteShare.note_id == note.id).all()
+            return _note_to_dict(note, user=user, shares=shares)
         finally:
             db.close()
 
@@ -683,10 +776,12 @@ def setup_note_routes(task_scheduler=None):
             note = db.query(Note).filter(Note.id == note_id).first()
             if not note:
                 raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
+            # Delete is owner-only. A collaborator who no longer wants the note
+            # uses DELETE /{id}/share/{their-username} to leave instead.
+            if "delete" not in _note_access(request, db, note, user):
                 raise HTTPException(404, "Note not found")
+            # Remove collaborator grants too (no FK cascade on this table).
+            db.query(NoteShare).filter(NoteShare.note_id == note.id).delete()
             db.delete(note)
             db.commit()
             return {"ok": True}
@@ -740,9 +835,8 @@ def setup_note_routes(task_scheduler=None):
             note = db.query(Note).filter(Note.id == note_id).first()
             if not note:
                 raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
+            # Checking off an item is an edit — owner or 'edit' collaborator.
+            if "write" not in _note_access(request, db, note, user):
                 raise HTTPException(404, "Note not found")
             # Toggle the index-th task line inside the markdown content.
             try:
@@ -754,6 +848,99 @@ def setup_note_routes(task_scheduler=None):
             db.refresh(note)
             items = parse_task_lines(note.content)
             return {"ok": True, "items": [{"text": t["text"], "done": t["done"], "indent": t["indent"]} for t in items]}
+        finally:
+            db.close()
+
+    # --- SHARE: list collaborators ---
+    @router.get("/{note_id}/shares")
+    def list_shares(request: Request, note_id: str):
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            note = db.query(Note).filter(Note.id == note_id).first()
+            if not note:
+                raise HTTPException(404, "Note not found")
+            if "share" not in _note_access(request, db, note, user):
+                raise HTTPException(404, "Note not found")
+            shares = db.query(NoteShare).filter(NoteShare.note_id == note.id).all()
+            return {"shared_with": [{"username": s.shared_with, "permission": s.permission} for s in shares]}
+        finally:
+            db.close()
+
+    # --- SHARE: grant access to other users (owner only) ---
+    @router.post("/{note_id}/share")
+    def share_note(request: Request, note_id: str, body: NoteShareRequest):
+        user = require_privilege(request, "can_share_notes")
+        db = SessionLocal()
+        try:
+            note = db.query(Note).filter(Note.id == note_id).first()
+            if not note:
+                raise HTTPException(404, "Note not found")
+            if "share" not in _note_access(request, db, note, user):
+                raise HTTPException(404, "Note not found")
+            perm = "view" if body.permission == "view" else "edit"
+            # Only grant to real, existing users (usernames are stored lowercased).
+            auth_mgr = getattr(request.app.state, "auth_manager", None)
+            valid = set((getattr(auth_mgr, "users", {}) or {}).keys()) if auth_mgr else None
+            owner_name = note.owner or ""
+            for raw in (body.users or []):
+                uname = (raw or "").strip().lower()
+                if not uname or uname == owner_name:
+                    continue
+                if valid is not None and uname not in valid:
+                    continue
+                existing = (
+                    db.query(NoteShare)
+                    .filter(NoteShare.note_id == note.id, NoteShare.shared_with == uname)
+                    .first()
+                )
+                if existing:
+                    existing.permission = perm
+                else:
+                    db.add(NoteShare(id=str(uuid.uuid4()), note_id=note.id,
+                                     shared_with=uname, permission=perm))
+            db.commit()
+            shares = db.query(NoteShare).filter(NoteShare.note_id == note.id).all()
+            # Self-heal: drop any share to a username that no longer exists
+            # (orphaned by an older rename/delete) so it can't linger as a
+            # phantom collaborator.
+            if valid is not None:
+                stale = [s for s in shares if s.shared_with not in valid]
+                if stale:
+                    for s in stale:
+                        db.delete(s)
+                    db.commit()
+                    shares = [s for s in shares if s not in stale]
+            return {"ok": True, "shared_with": [{"username": s.shared_with, "permission": s.permission} for s in shares]}
+        finally:
+            db.close()
+
+    # --- SHARE: revoke (owner removes anyone; a collaborator removes self = leave) ---
+    @router.delete("/{note_id}/share/{username}")
+    def unshare_note(request: Request, note_id: str, username: str):
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            note = db.query(Note).filter(Note.id == note_id).first()
+            if not note:
+                raise HTTPException(404, "Note not found")
+            target = (username or "").strip().lower()
+            caps = _note_access(request, db, note, user)
+            # Owner ("share") can remove any collaborator. Otherwise the only
+            # allowed action is a collaborator leaving the note — and only when
+            # they actually have access to it ("read" in caps means a NoteShare
+            # row names them; a stranger gets an empty set and a 404, so this
+            # can't be used as a note-existence oracle).
+            is_self_leave = user is not None and target == user and "read" in caps
+            if "share" not in caps and not is_self_leave:
+                raise HTTPException(404, "Note not found")
+            (
+                db.query(NoteShare)
+                .filter(NoteShare.note_id == note.id, NoteShare.shared_with == target)
+                .delete()
+            )
+            db.commit()
+            return {"ok": True}
         finally:
             db.close()
 
