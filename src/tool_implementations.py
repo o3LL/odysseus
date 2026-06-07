@@ -1847,6 +1847,13 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             return set()
         return {"read"} if sh.permission == "view" else {"read", "write"}
 
+    def _note_by_prefix(note_id: str):
+        # Resolve by id prefix without owner-filtering: access is governed by
+        # _note_caps so notes shared with the acting owner still resolve here.
+        if not note_id:
+            return None
+        return db.query(Note).filter(Note.id.startswith(note_id)).first()
+
     try:
         if action == "list":
             show_archived = args.get("archived", False)
@@ -2024,7 +2031,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
 
         elif action == "update":
             note_id = args.get("id", "")
-            note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
+            note = _note_by_prefix(note_id)
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
             if "write" not in _note_caps(note):
@@ -2061,7 +2068,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
 
         elif action == "delete":
             note_id = args.get("id", "")
-            note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
+            note = _note_by_prefix(note_id)
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
             if "delete" not in _note_caps(note):
@@ -2075,7 +2082,7 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
         elif action == "toggle_item":
             note_id = args.get("id", "")
             index = args.get("index", 0)
-            note = db.query(Note).filter(Note.id.startswith(note_id)).first() if note_id else None
+            note = _note_by_prefix(note_id)
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
             if "write" not in _note_caps(note):
@@ -2782,7 +2789,7 @@ async def _cookbook_register_task(session_id: str, model: str, host: str,
     placeholder = (
         f"Launched via agent — waiting for tmux output…\n"
         f"  session: {session_id}\n"
-        f"  target:  {target}{cmd.split()[0] if cmd else ''}\n"
+        f"  target:  {target}{(cmd.split() or [''])[0] if cmd else ''}\n"
         f"  cmd:     {cmd[:200]}{'…' if len(cmd) > 200 else ''}"
     )
     tasks.append({
@@ -2813,14 +2820,15 @@ async def _cookbook_register_task(session_id: str, model: str, host: str,
 
 
 # Paths the generic `app_api` tool will refuse to call. Auth/token/user
-# administration is too risky to route through an agent surface even
-# when the agent is admin-context — accidental "delete account"
-# style mistakes have permanent blast radius.
+# administration and host shell execution are too risky to route through an
+# agent surface even when the agent is admin-context; accidental account or
+# command mistakes have permanent blast radius.
 _APP_API_BLOCKLIST_PREFIXES = (
     "/api/auth",           # login/logout/password
     "/api/users",          # user CRUD (bare /api/users list+create+delete must also block)
     "/api/tokens",         # api token mgmt (bare /api/tokens list+create must also block)
     "/api/admin",          # admin one-shots (wipe etc.)
+    "/api/shell",          # host shell execution must stay behind named command tooling
     "/api/backup/restore", # destructive restore
 )
 
@@ -2857,7 +2865,7 @@ _APP_API_BLOCKLIST_METHOD_PATH = (
 
 
 async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
-    """Generic loopback to any internal Odysseus API endpoint. Lets the
+    """Generic loopback to allowed internal Odysseus API endpoints. Lets the
     agent reach the full UI-button surface (cookbook, email, notes,
     calendar, skills, sessions, gallery, research, etc.) without us
     landing a named tool wrapper for every one.
@@ -2871,7 +2879,8 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
 
     The `endpoints` action returns the OpenAPI surface (method + path +
     summary) so the agent can discover what's reachable. A blocklist
-    refuses auth/user/admin paths to keep blast radius bounded.
+    refuses sensitive auth/user/admin/shell paths to keep blast radius
+    bounded.
     """
     import httpx
     try:
@@ -2931,7 +2940,7 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
     if not path.startswith("/"):
         path = "/" + path
     if any(path.startswith(p) for p in _APP_API_BLOCKLIST_PREFIXES):
-        return {"error": f"Path blocked for safety: {path}. Auth/user/admin endpoints are off-limits via app_api.", "exit_code": 1}
+        return {"error": f"Path blocked for safety: {path}. Sensitive endpoints are off-limits via app_api.", "exit_code": 1}
 
     method = (args.get("method") or "GET").upper()
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
