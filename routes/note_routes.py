@@ -1,5 +1,5 @@
 # routes/note_routes.py
-"""Google Keep-style notes / checklists API."""
+"""Unified markdown notes API (Apple-Notes style: one document per note)."""
 
 import json
 import uuid
@@ -10,9 +10,9 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from core.database import SessionLocal, Note
+from core.notes_markdown import parse_task_lines, toggle_task, merge_items_into_content
 from src.auth_helpers import get_current_user
 from src.constants import DATA_DIR
-from sqlalchemy.orm.attributes import flag_modified
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +23,13 @@ logger = logging.getLogger(__name__)
 
 class NoteCreate(BaseModel):
     title: str = ""
+    # Markdown body and source of truth. Checklists are task lines inside it:
+    # `- [ ] todo` / `- [x] done`. They render as interactive checkboxes.
     content: Optional[str] = None
+    # Legacy/back-compat: a structured [{text, done, indent}] array. When given
+    # (and `content` has no task lines) it is folded into `content` as task lines.
     items: Optional[list] = None
-    note_type: str = "note"
+    note_type: str = "note"     # UI grouping label only; nothing branches on it server-side
     color: Optional[str] = None
     label: Optional[str] = None
     pinned: bool = False
@@ -39,9 +43,9 @@ class NoteCreate(BaseModel):
 
 class NoteUpdate(BaseModel):
     title: Optional[str] = None
-    content: Optional[str] = None
-    items: Optional[list] = None
-    note_type: Optional[str] = None
+    content: Optional[str] = None           # markdown; checklists are task lines
+    items: Optional[list] = None            # legacy; folded into content
+    note_type: Optional[str] = None         # UI grouping label only
     color: Optional[str] = None
     label: Optional[str] = None
     pinned: Optional[bool] = None
@@ -58,12 +62,11 @@ class NoteUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _note_to_dict(note: Note) -> Dict[str, Any]:
-    items = None
-    if note.items:
-        try:
-            items = json.loads(note.items)
-        except (json.JSONDecodeError, TypeError):
-            items = None
+    # `items` is derived from the markdown task lines in `content` (the source of
+    # truth). Returned for backward compatibility so older API/MCP consumers that
+    # read a structured checklist still see it; shape is {text, done, indent}.
+    tasks = parse_task_lines(note.content)
+    items = [{"text": t["text"], "done": t["done"], "indent": t["indent"]} for t in tasks] or None
     ai_cls = None
     raw_ai = getattr(note, "ai_classification", None)
     if raw_ai:
@@ -620,13 +623,18 @@ def setup_note_routes(task_scheduler=None):
         user = _owner(request)
         db = SessionLocal()
         try:
+            # Unified model: checklists live in `content` as markdown task lines.
+            # A legacy `items` array is folded in for backward-compatible callers.
+            content = merge_items_into_content(body.content, body.items)
             note = Note(
                 id=str(uuid.uuid4()),
                 owner=user,
                 title=body.title,
-                content=body.content,
-                items=json.dumps(body.items) if body.items is not None else None,
-                note_type=body.note_type,
+                content=content,
+                items=None,
+                # note_type survives as a pure UI label (goal/today views);
+                # nothing server-side branches on it anymore.
+                note_type=body.note_type or "note",
                 color=body.color,
                 label=body.label,
                 pinned=body.pinned,
@@ -677,11 +685,16 @@ def setup_note_routes(task_scheduler=None):
 
             if body.title is not None:
                 note.title = body.title
+            # Content is canonical. A legacy `items` array (with no explicit
+            # content) is folded into the markdown as task lines.
             if body.content is not None:
                 note.content = body.content
             if body.items is not None:
-                note.items = json.dumps(body.items)
-                flag_modified(note, "items")
+                note.content = merge_items_into_content(
+                    body.content if body.content is not None else note.content,
+                    body.items,
+                )
+                note.items = None
             if body.note_type is not None:
                 note.note_type = body.note_type
             if body.color is not None:
@@ -779,16 +792,16 @@ def setup_note_routes(task_scheduler=None):
             # let any user touch a row whose owner field was null/empty.
             if user is not None and note.owner != user:
                 raise HTTPException(404, "Note not found")
-            if not note.items:
-                raise HTTPException(400, "Note has no checklist items")
-            items = json.loads(note.items)
-            if index < 0 or index >= len(items):
+            # Toggle the index-th task line inside the markdown content.
+            try:
+                new_content, _ = toggle_task(note.content, index)
+            except IndexError:
                 raise HTTPException(400, f"Item index {index} out of range")
-            items[index]["done"] = not items[index].get("done", False)
-            note.items = json.dumps(items)
-            flag_modified(note, "items")
+            note.content = new_content
             db.commit()
-            return {"ok": True, "items": items}
+            db.refresh(note)
+            items = parse_task_lines(note.content)
+            return {"ok": True, "items": [{"text": t["text"], "done": t["done"], "indent": t["indent"]} for t in items]}
         finally:
             db.close()
 
