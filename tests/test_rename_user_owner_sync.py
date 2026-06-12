@@ -631,3 +631,38 @@ def test_rejected_rename_does_not_mutate_files(monkeypatch, tmp_path):
     assert json.loads(rp.read_text())["owner"] == "alice", "research owner mutated after rejected rename"
     assert json.loads(mem.read_text())[0]["owner"] == "alice", "memory owner mutated after rejected rename"
     assert "owner: alice" in (skill_dir / "SKILL.md").read_text(), "skill owner mutated after rejected rename"
+
+
+# ---------------------------------------------------------------------------
+# 5. uploads.json owner rows (delegated to UploadHandler.rename_owner)
+# ---------------------------------------------------------------------------
+
+def test_rename_repoints_upload_owner_rows(rename_endpoint):
+    """The rename route must hand the old/new usernames to the upload
+    handler — its uploads.json rows gate resolve_upload() by owner and key
+    dedupe entries as "{owner}:{hash}", so skipping this leaves the renamed
+    user's uploads (chat/document attachments, note images) unresolvable."""
+    endpoint, _am, tmp_path = rename_endpoint
+
+    calls = []
+    uh = SimpleNamespace(rename_owner=lambda old, new: calls.append((old, new)))
+    req = _request(tmp_path)
+    req.app.state.upload_handler = uh
+
+    asyncio.run(endpoint("alice", SimpleNamespace(username="alice2"), req))
+
+    assert calls == [("alice", "alice2")]
+
+
+def test_rename_survives_upload_handler_failure(rename_endpoint):
+    """A broken uploads index must not abort the rest of the rename sweep."""
+    endpoint, _am, tmp_path = rename_endpoint
+
+    def _boom(_old, _new):
+        raise RuntimeError("uploads.json unreadable")
+
+    req = _request(tmp_path)
+    req.app.state.upload_handler = SimpleNamespace(rename_owner=_boom)
+
+    res = asyncio.run(endpoint("alice", SimpleNamespace(username="alice2"), req))
+    assert res["ok"] is True

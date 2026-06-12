@@ -31004,6 +31004,12 @@ body.notes-mobile-mode.notes-drag-mode .note-card-pin.active {
 }
 .md-task:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
 .md-task:hover .md-task-box { border-color: var(--green, #98c379); }
+/* View-only shared notes ([data-readonly] body/card): tasks render but don't
+   toggle — no pointer affordance, no hover highlight. */
+[data-readonly] .md-task { cursor: default; }
+[data-readonly] .md-task:hover { background: transparent; }
+[data-readonly] .md-task:hover .md-task-box { border-color: var(--border); }
+[data-readonly] .md-task-box { opacity: 0.75; }
 .md-task-box {
   width: 18px;
   height: 18px;

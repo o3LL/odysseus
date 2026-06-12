@@ -119,8 +119,15 @@ def _note_to_dict(note: Note, user: Optional[str] = None, shares=None) -> Dict[s
         "is_owner": is_owner,
         # Who this note was shared by (the owner) when you're not the owner.
         "shared_by": None if is_owner else note.owner,
-        # Collaborators (meaningful to the owner): [{username, permission}].
-        "shared_with": [{"username": s.shared_with, "permission": s.permission} for s in shares],
+        # Collaborators: [{username, permission}]. Owner-only (the owner is the
+        # sole holder of the 'share' capability) — a collaborator must not learn
+        # who else the note was shared with. They get their own grant via
+        # `my_permission`/`can_edit` and the owner via `shared_by`.
+        "shared_with": (
+            [{"username": s.shared_with, "permission": s.permission} for s in shares]
+            if is_owner else []
+        ),
+        "my_permission": my_perm,
         "is_shared": len(shares) > 0,
         "can_edit": is_owner or my_perm == "edit",
         "title": note.title,
@@ -770,8 +777,18 @@ def setup_note_routes(task_scheduler=None):
                 raise HTTPException(404, "Note not found")
             # Owner or an 'edit' collaborator may write; everyone else gets the
             # same 404 as a non-existent note (don't reveal it exists).
-            if "write" not in _note_access(request, db, note, user):
+            caps = _note_access(request, db, note, user)
+            if "write" not in caps:
                 raise HTTPException(404, "Note not found")
+            # pinned/archived/sort_order are note-management state, not content:
+            # the dedicated /pin and /archive routes are owner-only, and this
+            # generic route must not hand an 'edit' collaborator a side door to
+            # archive/hide, pin, or reorder the owner's note. 'delete' is only
+            # ever granted to the owner, so it doubles as the owner check.
+            if "delete" not in caps and (
+                body.pinned is not None or body.archived is not None or body.sort_order is not None
+            ):
+                raise HTTPException(403, "Only the note's owner can pin, archive, or reorder it")
 
             if body.title is not None:
                 note.title = body.title

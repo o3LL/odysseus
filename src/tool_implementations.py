@@ -1433,8 +1433,15 @@ async def do_manage_notes(content: str, owner: Optional[str] = None) -> Dict:
             note = _note_by_prefix(note_id)
             if not note:
                 return {"error": f"Note '{note_id}' not found", "exit_code": 1}
-            if "write" not in _note_caps(note):
+            caps = _note_caps(note)
+            if "write" not in caps:
                 return {"error": "Note not found", "exit_code": 1}
+            # pinned/archived are owner-only management state (mirrors the REST
+            # update route): an 'edit' share grants content collaboration, not
+            # the power to archive/hide or pin the owner's note. 'delete' is
+            # only ever granted to the owner, so it doubles as the owner check.
+            if "delete" not in caps and ("pinned" in args or "archived" in args):
+                return {"error": "Only the note's owner can pin or archive it", "exit_code": 1}
             for field in ("title", "content", "color", "label"):
                 if field in args and args[field] is not None:
                     setattr(note, field, args[field])

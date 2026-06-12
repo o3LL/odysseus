@@ -33,7 +33,10 @@ CALENDAR_READ_SCOPES = {"calendar:read", "calendar:write"}
 CALENDAR_WRITE_SCOPES = {"calendar:write"}
 DOCS_READ_SCOPES = {"documents:read", "documents:write"}
 DOCS_WRITE_SCOPES = {"documents:write"}
-WRITE_ACTIONS = {"add", "create", "new", "save", "remind", "update", "delete", "toggle_item", "remove", "remove_item"}
+# Every manage_notes action that mutates state must be listed here (aliases
+# included) — anything missing falls through to the read-scope gate, letting a
+# todos:read token write. `share`/`unshare` mutate the note's ACL.
+WRITE_ACTIONS = {"add", "create", "new", "save", "remind", "update", "delete", "toggle_item", "remove", "remove_item", "share", "unshare"}
 
 
 async def _as_owner(request: Request, owner: str, fn, *args, **kwargs):
@@ -116,7 +119,7 @@ def setup_codex_routes(
                 "todos": {
                     "read": scoped(TODO_READ_SCOPES),
                     "write": scoped(TODO_WRITE_SCOPES),
-                    "actions": ["list", "add", "update", "delete", "toggle_item"],
+                    "actions": ["list", "get", "add", "update", "delete", "toggle_item", "share", "unshare"],
                 },
                 "email": {
                     "read": scoped(EMAIL_READ_SCOPES),

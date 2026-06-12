@@ -246,3 +246,163 @@ def test_rename_user_repoints_note_shares(monkeypatch):
         assert names == ["bobby"], names
     finally:
         os.unlink(db_path)
+
+
+def _notes_client(monkeypatch, db):
+    """TestClient over the real note routes; the acting user comes from the
+    x-test-user header (mirrors what the auth middleware would set)."""
+    from types import SimpleNamespace
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import routes.note_routes as nr
+
+    # note_routes binds SessionLocal at import time; point it at the temp DB.
+    monkeypatch.setattr(nr, "SessionLocal", db.SessionLocal)
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _user(request, call_next):
+        request.state.current_user = request.headers.get("x-test-user")
+        return await call_next(request)
+
+    app.state.auth_manager = SimpleNamespace(
+        is_configured=True, users={"alice": {}, "bob": {}, "carol": {}}
+    )
+    app.include_router(nr.setup_note_routes())
+    return TestClient(app)
+
+
+def test_update_route_management_fields_are_owner_only(monkeypatch):
+    """PR #2940 review (P2): the generic PUT must not let an 'edit'
+    collaborator flip pinned/archived/sort_order — that's the same owner-only
+    state the dedicated /pin and /archive routes protect."""
+    db_path, db = _make_db(monkeypatch)
+    try:
+        from core.database import Note, NoteShare
+
+        client = _notes_client(monkeypatch, db)
+        s = db.SessionLocal()
+        n = Note(id=str(uuid.uuid4()), owner="alice", title="t", content="- [ ] a")
+        s.add(n)
+        s.add(NoteShare(id=str(uuid.uuid4()), note_id=n.id, shared_with="bob", permission="edit"))
+        s.add(NoteShare(id=str(uuid.uuid4()), note_id=n.id, shared_with="carol", permission="view"))
+        s.commit()
+        nid = n.id
+        s.close()
+
+        alice = {"x-test-user": "alice"}
+        bob = {"x-test-user": "bob"}
+        carol = {"x-test-user": "carol"}
+
+        # Content collaboration still works for the edit collaborator.
+        assert client.put(f"/api/notes/{nid}", json={"content": "- [x] a"}, headers=bob).status_code == 200
+        # A view collaborator can't write at all (404: don't reveal existence).
+        assert client.put(f"/api/notes/{nid}", json={"content": "x"}, headers=carol).status_code == 404
+
+        # Management state is rejected for the edit collaborator…
+        for payload in (
+            {"archived": True},
+            {"pinned": True},
+            {"sort_order": 0},
+            {"archived": True, "pinned": True, "sort_order": 0},
+        ):
+            r = client.put(f"/api/notes/{nid}", json=payload, headers=bob)
+            assert r.status_code == 403, (payload, r.text)
+
+        # …and none of it leaked into the row.
+        s = db.SessionLocal()
+        row = s.query(Note).filter(Note.id == nid).first()
+        assert not row.archived and not row.pinned
+        s.close()
+
+        # The owner keeps full control through the same route.
+        r = client.put(
+            f"/api/notes/{nid}",
+            json={"archived": True, "pinned": True, "sort_order": 5},
+            headers=alice,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["archived"] is True and body["pinned"] is True and body["sort_order"] == 5
+    finally:
+        os.unlink(db_path)
+
+
+def test_collaborators_do_not_see_the_roster(monkeypatch):
+    """PR #2940 review (privacy): `shared_with` is owner-only. A collaborator
+    gets their own grant (my_permission/can_edit) and the owner (shared_by),
+    never the other collaborators' usernames."""
+    db_path, db = _make_db(monkeypatch)
+    try:
+        from core.database import Note, NoteShare
+
+        client = _notes_client(monkeypatch, db)
+        s = db.SessionLocal()
+        n = Note(id=str(uuid.uuid4()), owner="alice", title="t", content="x")
+        s.add(n)
+        s.add(NoteShare(id=str(uuid.uuid4()), note_id=n.id, shared_with="bob", permission="edit"))
+        s.add(NoteShare(id=str(uuid.uuid4()), note_id=n.id, shared_with="carol", permission="view"))
+        s.commit()
+        nid = n.id
+        s.close()
+
+        # Owner sees the full roster.
+        owner_view = client.get(f"/api/notes/{nid}", headers={"x-test-user": "alice"}).json()
+        assert {(x["username"], x["permission"]) for x in owner_view["shared_with"]} == {
+            ("bob", "edit"),
+            ("carol", "view"),
+        }
+
+        # Edit collaborator: own grant only, no roster.
+        bob_view = client.get(f"/api/notes/{nid}", headers={"x-test-user": "bob"}).json()
+        assert bob_view["shared_with"] == []
+        assert bob_view["my_permission"] == "edit"
+        assert bob_view["can_edit"] is True
+        assert bob_view["shared_by"] == "alice"
+        assert bob_view["is_shared"] is True
+
+        # View collaborator, via GET and via the list route.
+        carol_view = client.get(f"/api/notes/{nid}", headers={"x-test-user": "carol"}).json()
+        assert carol_view["shared_with"] == []
+        assert carol_view["my_permission"] == "view"
+        assert carol_view["can_edit"] is False
+
+        listed = client.get("/api/notes", headers={"x-test-user": "carol"}).json()["notes"]
+        entry = next(x for x in listed if x["id"] == nid)
+        assert entry["shared_with"] == []
+        assert entry["my_permission"] == "view"
+    finally:
+        os.unlink(db_path)
+
+
+def test_manage_notes_update_management_fields_are_owner_only(monkeypatch):
+    """The MCP `update` action mirrors the REST split: an edit collaborator
+    can change content but not pinned/archived."""
+    db_path, db = _make_db(monkeypatch)
+    try:
+        import core.auth as auth_mod
+
+        class _FakeAuth:
+            users = {"alice": {}, "bob": {}}
+
+            def get_privileges(self, u):
+                return {"can_share_notes": True}
+
+        monkeypatch.setattr(auth_mod, "AuthManager", _FakeAuth)
+        from src.tool_implementations import do_manage_notes
+
+        def call(owner, **args):
+            return asyncio.run(do_manage_notes(json.dumps(args), owner=owner))
+
+        nid = call("alice", action="add", title="T", content="x")["response"].split("id: ")[1].rstrip(")")
+        call("alice", action="share", id=nid, users=["bob"])
+
+        # Content edit is fine; management state is owner-only.
+        assert "updated" in call("bob", action="update", id=nid, content="y").get("response", "")
+        assert call("bob", action="update", id=nid, pinned=True).get("error")
+        assert call("bob", action="update", id=nid, archived=True).get("error")
+        # The owner can still do both at once.
+        assert "updated" in call("alice", action="update", id=nid, pinned=True, archived=True).get("response", "")
+    finally:
+        os.unlink(db_path)

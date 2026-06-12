@@ -498,6 +498,8 @@ app.state.session_manager = session_manager
 memory_manager    = components["memory_manager"]
 memory_vector     = components.get("memory_vector")
 upload_handler    = components["upload_handler"]
+# Exposed for the user-rename route, which re-points uploads.json owners.
+app.state.upload_handler = upload_handler
 personal_docs_mgr = components["personal_docs_manager"]
 api_key_manager   = components["api_key_manager"]
 preset_manager    = components["preset_manager"]
