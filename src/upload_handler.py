@@ -343,51 +343,6 @@ class UploadHandler:
                 continue
         return {}
 
-    def rename_owner(self, old_owner: str, new_owner: str) -> int:
-        """Re-point uploads.json metadata after a user rename.
-
-        Each row's `owner` field gates resolve_upload(), and dedupe keys are
-        owner-prefixed ("{owner}:{hash}") — both keep pointing at the old
-        username after a rename, which makes the renamed user's existing
-        chat/document uploads and note images unresolvable. Owners match
-        case-insensitively (the auth layer's lowercase contract). If the new
-        owner already holds a row under the same dedupe key (both accounts
-        uploaded the same bytes), the existing row wins and the stale one is
-        dropped. Returns the number of rows re-pointed.
-        """
-        old_l = str(old_owner or "").strip().lower()
-        if not old_l or not new_owner or old_l == str(new_owner).strip().lower():
-            return 0
-        uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
-        changed = 0
-        with self._index_lock:
-            index = self._load_upload_index()
-
-            def _mine(info) -> bool:
-                return isinstance(info, dict) and str(info.get("owner") or "").strip().lower() == old_l
-
-            # Keys staying put (other owners, ownerless legacy rows) — a moved
-            # key must not collide with any of these.
-            taken = {k for k, v in index.items() if not _mine(v)}
-            new_index: Dict[str, Any] = {}
-            for key, info in index.items():
-                if not _mine(info):
-                    new_index[key] = info
-                    continue
-                row = dict(info)
-                row["owner"] = new_owner
-                prefix, sep, suffix = key.partition(":")
-                new_key = f"{new_owner}:{suffix}" if sep and prefix.strip().lower() == old_l else key
-                if new_key != key and (new_key in taken or new_key in new_index):
-                    continue  # new owner already has these bytes; keep theirs
-                new_index[new_key] = row
-                changed += 1
-            if changed or len(new_index) != len(index):
-                self._atomic_write_json(uploads_db_path, new_index)
-        if changed:
-            logger.info("Re-pointed %d upload rows from %s to %s", changed, old_owner, new_owner)
-        return changed
-
     def get_upload_info(self, upload_id: str) -> Optional[Dict[str, Any]]:
         """Return the uploads.json metadata row for an upload ID, if present."""
         if not self.validate_upload_id(upload_id):
@@ -396,6 +351,86 @@ class UploadHandler:
             if isinstance(info, dict) and info.get("id") == upload_id:
                 return dict(info)
         return None
+
+    def _renamed_upload_index_key(self, key: str, info: Dict[str, Any], old_owner: str, new_owner: str) -> str:
+        """Return the storage key to use after renaming an owned upload row."""
+        if isinstance(key, str) and ":" in key:
+            owner_part, rest = key.split(":", 1)
+            if owner_part.strip().lower() == old_owner:
+                return f"{new_owner}:{rest}"
+        file_hash = info.get("hash")
+        if file_hash:
+            return f"{new_owner}:{file_hash}"
+        return key
+
+    def _unique_upload_index_key(self, base_key: str, used_keys: set, reserved_keys: set, info: Dict[str, Any]) -> str:
+        """Choose a deterministic collision key without overwriting an existing row."""
+        if base_key not in used_keys and base_key not in reserved_keys:
+            return base_key
+
+        upload_id = str(info.get("id") or "renamed").strip() or "renamed"
+        candidate = f"{base_key}:{upload_id}"
+        if candidate not in used_keys and candidate not in reserved_keys:
+            return candidate
+
+        index = 2
+        while True:
+            candidate = f"{base_key}:{upload_id}:{index}"
+            if candidate not in used_keys and candidate not in reserved_keys:
+                return candidate
+            index += 1
+
+    def rename_owner(self, old_owner: str, new_owner: str) -> int:
+        """Rename upload metadata ownership from old_owner to new_owner.
+
+        Upload rows are keyed by owner-qualified hashes for dedupe and also
+        carry an `owner` field for access checks. Both must move together when
+        usernames change.
+        """
+        old_owner_normalized = str(old_owner or "").strip().lower()
+        new_owner = str(new_owner or "").strip()
+        if not old_owner_normalized or not new_owner:
+            return 0
+        if old_owner_normalized == new_owner.lower():
+            return 0
+
+        uploads_db_path = os.path.join(self.upload_dir, "uploads.json")
+        with self._index_lock:
+            current = self._load_upload_index()
+            if not current:
+                return 0
+
+            updated = {}
+            renamed = 0
+            original_keys = set(current.keys())
+
+            for key, info in current.items():
+                new_key = key
+                new_info = info
+                if isinstance(info, dict) and str(info.get("owner", "")).strip().lower() == old_owner_normalized:
+                    new_info = dict(info)
+                    new_info["owner"] = new_owner
+                    base_key = self._renamed_upload_index_key(key, new_info, old_owner_normalized, new_owner)
+                    new_key = self._unique_upload_index_key(
+                        base_key,
+                        set(updated.keys()),
+                        original_keys - {key},
+                        new_info,
+                    )
+                    if new_key != base_key:
+                        logger.warning(
+                            "Upload owner rename key collision for %s -> %s at %s; preserving row as %s",
+                            old_owner_normalized,
+                            new_owner,
+                            base_key,
+                            new_key,
+                        )
+                    renamed += 1
+                updated[new_key] = new_info
+
+            if renamed:
+                self._atomic_write_json(uploads_db_path, updated)
+            return renamed
 
     def _find_upload_path(self, upload_id: str) -> Optional[str]:
         """Find an upload file by ID while staying inside upload_dir."""

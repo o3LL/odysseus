@@ -400,18 +400,6 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         except Exception as e:
             logger.warning("Failed to rename active research tasks %s -> %s: %s", old_username, new_username, e)
 
-        # uploads.json: every row carries an `owner` field that resolve_upload()
-        # enforces, and dedupe keys are owner-prefixed ("{owner}:{hash}"). Left
-        # stale, the renamed user's existing chat/document uploads and
-        # upload-backed note images stop resolving.
-        try:
-            uh = getattr(request.app.state, "upload_handler", None)
-            rename_uploads = getattr(uh, "rename_owner", None)
-            if callable(rename_uploads):
-                rename_uploads(old_username, new_username)
-        except Exception as e:
-            logger.warning("Failed to rename upload owner references %s -> %s: %s", old_username, new_username, e)
-
         # deep_research: each completed report is a standalone JSON file with
         # an `owner` field. research_routes filters by d.get("owner") == user,
         # so a stale owner makes every report invisible to the renamed user.
@@ -446,6 +434,17 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                         atomic_write_json(MEMORY_FILE, entries)
         except Exception as e:
             logger.warning("Failed to rename memory.json owner references %s -> %s: %s", old_username, new_username, e)
+
+        # uploads.json: upload rows use owner metadata for access checks and
+        # owner-prefixed index keys for dedupe. Rename both so attachments keep
+        # resolving after the account username changes.
+        try:
+            upload_handler = getattr(request.app.state, "upload_handler", None)
+            rename_owner = getattr(upload_handler, "rename_owner", None)
+            if callable(rename_owner):
+                rename_owner(old_username, new_username)
+        except Exception as e:
+            logger.warning("Failed to rename upload owner references %s -> %s: %s", old_username, new_username, e)
 
         # skills: SKILL.md frontmatter carries owner: <username>; the usage
         # sidecar (_usage.json) keys entries as owner::skill-name. Both must
