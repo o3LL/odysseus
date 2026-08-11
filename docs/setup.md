@@ -471,6 +471,67 @@ Odysseus serves plain HTTP on its app port. Docker Compose binds Odysseus and th
 Cloudflare Access, Tailscale, Caddy, nginx, and Traefik can all fit this pattern; none are required by Odysseus. If your access layer reaches Odysseus on the same host, proxy to `http://127.0.0.1:7000` and keep `AUTH_ENABLED=true`, `LOCALHOST_BYPASS=false`, and `SECURE_COOKIES=true`.
 `ALLOWED_ORIGINS` lists exact permitted origins for cross-origin browser/API clients; ordinary same-origin reverse-proxy access usually does not need a special CORS entry.
 
+#### Why the proxy is worth it: HTTP/2
+
+The frontend is raw ES modules with no bundler, so a page load is a few hundred
+small same-origin requests. Over HTTP/1.1 browsers cap concurrency at 6
+connections per origin, so those requests serialise into dozens of sequential
+round trips. On localhost that costs almost nothing. Over a LAN, VPN, or any
+remote link it dominates load time, and it gets worse the higher the latency.
+
+HTTP/2 multiplexes them onto one connection and the serialisation disappears.
+Odysseus needs no changes for this — uvicorn keeps speaking HTTP/1.1 on
+loopback and the proxy speaks HTTP/2 to the browser. Browsers only negotiate
+HTTP/2 over TLS, so this requires a certificate; there is no cleartext path.
+
+A complete Caddyfile, which enables HTTP/2 automatically:
+
+```
+odysseus.example.com {
+	reverse_proxy 127.0.0.1:7000
+}
+```
+
+Caddy obtains and renews the certificate itself for a public domain. On a
+private network, supply your own with `tls <cert-file> <key-file>` — on a
+Tailscale tailnet, `tailscale cert <host>.<tailnet>.ts.net` issues a
+browser-trusted certificate. If ports 80/443 are already taken, append a port
+to the site address (`odysseus.example.com:8443`) and use it in the URL.
+
+Server-sent events are not buffered by this configuration, so chat streaming
+arrives token by token; add `flush_interval -1` inside the `reverse_proxy`
+block if you want that pinned explicitly. nginx needs
+`proxy_buffering off;` for the same reason.
+
+The service that supervises Odysseus is unchanged — the proxy is a second
+service alongside it:
+
+| Platform | Odysseus | Proxy |
+|---|---|---|
+| Linux | `odysseus-ui.service` (systemd) | Caddy as a systemd unit |
+| macOS | launchd agent, or `start-macos.sh` | `brew services start caddy` |
+| Windows | `launch-windows.ps1`, or a service wrapper | Caddy as a Windows service |
+| Docker | `docker compose up` | a proxy container, or a proxy on the host pointing at the published port |
+
+Three things to get right when moving an existing install behind TLS:
+
+- Set `SECURE_COOKIES=true` **at the same time** you stop serving plain HTTP,
+  not before. The flag is applied to every login regardless of the scheme the
+  request arrived on, so while an HTTP entrypoint is still reachable the
+  browser will reject the `Secure` cookie there and login will appear to loop.
+- Set `GOOGLE_OAUTH_REDIRECT_URI` (and `OAUTH_REDIRECT_BASE_URL` if you use MCP
+  OAuth) to the new external origin. Both default to values that assume a
+  local HTTP install.
+- Odysseus sends `Strict-Transport-Security` once it sees `X-Forwarded-Proto:
+  https`. HSTS applies to the whole hostname and ignores the port, so any other
+  plain-HTTP service on that same hostname becomes unreachable in browsers that
+  have visited Odysseus. Give Odysseus its own hostname, or strip the header at
+  the proxy (`header_down -Strict-Transport-Security` in Caddy).
+
+Changing the external origin also resets anything scoped to the old one: the
+service worker and its caches do not carry over, so the first load is cold, and
+session cookies do not carry over, so expect one re-login.
+
 Common internal-only ports from the default docs/compose setup:
 
 | Port | Service |
