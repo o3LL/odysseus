@@ -292,6 +292,29 @@ def test_deferred_math_schedules_a_katex_load(node_available):
     assert out["scriptSrcs"] == [KATEX_SRC]
 
 
+def test_math_entities_are_not_double_unescaped(node_available):
+    """A literal "&lt;" in math must survive as "&lt;", not collapse to "<".
+
+    mdToHtml escapes the source before the math pass, so the user's "&lt;"
+    arrives as "&amp;lt;". Unescaping "&amp;" first turns it back into "&lt;"
+    and the very next pass eats it, which is the same double-unescape the
+    code-block pass already avoids by unescaping "&amp;" last.
+    """
+    out = _run_node(
+        """
+        globalThis.window.katex = { renderToString: (src) => `<K>${src}</K>` };
+        globalThis.katex = globalThis.window.katex;
+        emit({
+          entity: mod.mdToHtml('Math: $a &lt; b$ done.'),
+          realLt: mod.mdToHtml('Math: $a < b$ done.'),
+        });
+        """
+    )
+    assert "<K>a &lt; b</K>" in out["entity"]
+    # A genuinely typed "<" is untouched by the reorder.
+    assert "<K>a < b</K>" in out["realLt"]
+
+
 def test_md_to_html_renders_inline_once_katex_is_loaded(node_available):
     """After the first load mdToHtml goes back to typesetting synchronously."""
     out = _run_node(

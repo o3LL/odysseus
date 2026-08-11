@@ -727,7 +727,10 @@ export function mdToHtml(src, opts) {
   // Typeset straight away when KaTeX is already in, otherwise bank the source in
   // an inert placeholder for renderMath() to swap once the library lands.
   const pushMath = (math, displayMode) => {
-    const raw = math.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
+    // Unescape &amp; LAST, matching the code-block pass above. Doing it first
+    // double-unescapes: a literal "&lt;" reaches here as "&amp;lt;", becomes
+    // "&lt;" on the & pass, and then collapses to "<" on the next one.
+    const raw = math.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').trim();
     const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
     if (window.katex) {
       mathBlocks.push(katex.renderToString(raw, { displayMode, throwOnError: false }));
