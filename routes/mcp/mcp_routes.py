@@ -475,7 +475,9 @@ def setup_mcp_routes(mcp_manager: McpManager):
                 return RedirectResponse(auth_url)
             else:
                 # Remote device — show paste-back page
-                return HTMLResponse(_oauth_authorize_page(auth_url, server_id, host, redirect_uri))
+                return HTMLResponse(_oauth_authorize_page(
+                    auth_url, server_id, host, redirect_uri, request.url.scheme
+                ))
         finally:
             db.close()
 
@@ -613,7 +615,8 @@ def _oauth_authorize_page(
     auth_url: str,
     server_id: str,
     host: str,
-    redirect_uri: str = "http://localhost:7000/api/mcp/oauth/callback",
+    redirect_uri: str,
+    scheme: str,
 ) -> str:
     """Page with Google sign-in link and URL paste-back form for remote access."""
     # Escape values interpolated into the page: `host` comes from the request
@@ -622,6 +625,11 @@ def _oauth_authorize_page(
     server_id = html.escape(server_id, quote=True)
     host = html.escape(host, quote=True)
     redirect_uri = html.escape(redirect_uri, quote=True)
+    # The paste-back form posts the authorization code back to the origin this
+    # page was served from, so the action has to carry the scheme the request
+    # arrived on. A hardcoded http:// action is blocked as mixed content on
+    # every HTTPS deployment, which is exactly where paste-back is needed.
+    scheme = "https" if scheme == "https" else "http"
     return f"""<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8"><title>Authorize — Odysseus</title>
@@ -664,7 +672,7 @@ def _oauth_authorize_page(
   </div>
   <a class="auth-link" href="{auth_url}" target="_blank" rel="noopener">Sign in with Google</a>
   <div class="divider"></div>
-  <form method="POST" action="http://{host}/api/mcp/oauth/exchange/{server_id}">
+  <form method="POST" action="{scheme}://{host}/api/mcp/oauth/exchange/{server_id}">
     <p>Paste the URL from your browser after signing in:</p>
     <input type="text" name="callback_url" placeholder="{redirect_uri}?code=..." required>
     <br><button type="submit">Connect</button>
