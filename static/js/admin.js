@@ -6,6 +6,7 @@ import settingsModule from './settings.js';
 import { providerLogo, providerLogoFromUrl } from './providers.js';
 import { sortModelObjects } from './modelSort.js';
 import { PROVIDER_DEVICE_FLOWS, formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
+import { getSettings, getTools, invalidateSettings, invalidateTools } from './appConfig.js';
 
 let initialized = false;
 let modalEl = null;
@@ -345,8 +346,7 @@ function initSignupToggle() {
 
 function initShareDefaultsToggle() {
   const toggle = el('adm-shareDefaultsToggle');
-  fetch('/api/auth/settings', { credentials: 'same-origin' })
-    .then(r => r.json())
+  getSettings()
     .then(d => { toggle.checked = !!d.share_defaults_with_users; })
     .catch(e => console.warn('Settings fetch failed:', e));
   toggle.addEventListener('change', async () => {
@@ -361,6 +361,9 @@ function initShareDefaultsToggle() {
       toggle.checked = !!data.share_defaults_with_users;
     } catch (e) {
       toggle.checked = !toggle.checked;
+    } finally {
+      // Drop the shared snapshot: it still says what this toggle used to be.
+      invalidateSettings();
     }
   });
 }
@@ -1893,8 +1896,7 @@ async function loadBuiltinTools() {
   const list = el('adm-builtin-tools-list');
   if (!list) return;
   try {
-    const res = await fetch('/api/tools', { credentials: 'same-origin' });
-    const data = await res.json();
+    const data = await getTools();
     const tools = data.tools || [];
     if (!tools.length) { list.innerHTML = '<div class="admin-empty">No tools found</div>'; return; }
 
@@ -1973,12 +1975,19 @@ async function loadBuiltinTools() {
       const allChecks = list.querySelectorAll('input[data-tool-id]');
       const disabled = [];
       allChecks.forEach(c => { if (!c.checked) disabled.push(c.dataset.toolId); });
-      await fetch('/api/tools', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ disabled }),
-        credentials: 'same-origin',
-      });
+      try {
+        await fetch('/api/tools', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ disabled }),
+          credentials: 'same-origin',
+        });
+      } finally {
+        // This route persists disabled_tools into the settings store
+        // (routes/model_routes.py), so both snapshots are now stale.
+        invalidateTools();
+        invalidateSettings();
+      }
     }
     function _updateCatCounter(catEl) {
       if (!catEl) return;
