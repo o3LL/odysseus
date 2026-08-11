@@ -68,7 +68,9 @@ Vendored in `static/lib/` and served directly:
 | [KaTeX](https://github.com/KaTeX/KaTeX) v0.16.22 (`katex/katex.min.{js,css}` + `katex/fonts/*.woff2`) | Math typesetting | MIT ([`licenses/KaTeX-MIT-LICENSE.txt`](licenses/KaTeX-MIT-LICENSE.txt)) |
 | [Mermaid](https://github.com/mermaid-js/mermaid) v11.16.1 (`mermaid.min.js`) | Diagrams from text | MIT ([`licenses/Mermaid-MIT-LICENSE.txt`](licenses/Mermaid-MIT-LICENSE.txt)) |
 
-Only the `.woff2` KaTeX fonts are shipped, matching `static/fonts/`; the
+KaTeX and Mermaid are loaded on first use by `static/js/markdown.js` rather than
+from `index.html`, so a session that renders no math and no diagram never fetches
+either. Only the `.woff2` KaTeX fonts are shipped, matching `static/fonts/`; the
 `.woff` and `.ttf` variants its stylesheet also lists are never requested by a
 browser that supports `woff2`. The bundles are the published npm artifacts,
 unmodified — `.gitattributes` turns the whitespace check off for `static/lib/`
