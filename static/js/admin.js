@@ -1896,6 +1896,15 @@ async function loadBuiltinTools() {
   const list = el('adm-builtin-tools-list');
   if (!list) return;
   try {
+    // This panel is an editor, and its save posts the whole disabled list
+    // rebuilt from the checkboxes below. So it has to render authoritative
+    // state: a snapshot that went stale out of band (the manage_settings tool,
+    // another tab) would be re-posted wholesale on the next unrelated toggle
+    // and would silently undo the newer state. refreshAll() calls this on every
+    // panel open, so drop the shared entry and refill it. The startup read that
+    // chatRenderer.js shares is unaffected; this panel just never edits a cache,
+    // which is the same rule the settings panel follows by reading directly.
+    invalidateTools();
     const data = await getTools();
     const tools = data.tools || [];
     if (!tools.length) { list.innerHTML = '<div class="admin-empty">No tools found</div>'; return; }

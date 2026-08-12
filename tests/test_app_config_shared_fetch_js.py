@@ -238,6 +238,71 @@ def test_every_settings_writer_invalidates_the_shared_cache():
     )
 
 
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_out_of_band_tool_change_is_not_undone_by_an_unrelated_panel_save():
+    """Admin > Tools must render authoritative state, not the startup snapshot.
+
+    The save posts the whole disabled-tool list rebuilt from the checkboxes, so
+    a stale render turns any unrelated toggle into a lost update: a tool
+    disabled out of band (manage_settings, another tab) comes back enabled.
+    refreshAll() calls loadBuiltinTools() on every panel open, which is why the
+    editor drops the shared entry before reading it.
+    """
+    body = """
+    // Boot: chatRenderer.js reads the tool list for the exec-fence regex.
+    __queue(__json({ tools: [{ id: 'web_search', enabled: true }, { id: 'shell', enabled: true }] }));
+    const boot = await getTools();
+
+    // Out of band, this page hearing nothing about it: web_search is disabled.
+    __queue(__json({ tools: [{ id: 'web_search', enabled: false }, { id: 'shell', enabled: true }] }));
+
+    // Admin > Tools opens. loadBuiltinTools() invalidates, then reads.
+    invalidateTools();
+    const panel = await getTools();
+
+    // The user toggles one unrelated tool off. The save posts every unchecked
+    // box, so the list is only right if the render was authoritative.
+    const post = (snapshot) => {
+      const boxes = snapshot.tools.map(t => ({ id: t.id, checked: t.enabled }));
+      boxes.find(b => b.id === 'shell').checked = false;
+      return boxes.filter(b => !b.checked).map(b => b.id);
+    };
+
+    console.log(JSON.stringify({
+      requests: __calls().length,
+      posted: post(panel),
+      postedFromStaleSnapshot: post(boot),
+    }));
+    """
+    assert json.loads(_run(body)) == {
+        "requests": 2,
+        # web_search stays disabled, which is the point.
+        "posted": ["web_search", "shell"],
+        # What the page-lifetime snapshot would have posted: web_search silently
+        # re-enabled by a toggle that had nothing to do with it.
+        "postedFromStaleSnapshot": ["shell"],
+    }
+
+
+def test_the_admin_tools_editor_does_not_read_a_cached_snapshot():
+    """Pin the invalidate-before-read in loadBuiltinTools().
+
+    A source scan because the failure is an ordering in a call site, not
+    behaviour of the cache: getTools() is doing exactly its job either way.
+    """
+    source = (_REPO / "static" / "js" / "admin.js").read_text(encoding="utf-8")
+    match = re.search(r"\nasync function loadBuiltinTools\(\) \{\n(.*?)\n\}\n", source, re.S)
+    assert match, "loadBuiltinTools() not found in static/js/admin.js"
+    body = match.group(1)
+    read = body.find("getTools(")
+    assert read != -1, "loadBuiltinTools() no longer reads the shared tool cache"
+    assert "invalidateTools(" in body[:read], (
+        "loadBuiltinTools() reads the shared /api/tools snapshot without dropping "
+        "it first, so a reopened panel can render tool state that changed out of "
+        "band and re-post it on the next unrelated toggle"
+    )
+
+
 def test_appconfig_is_precached_by_the_service_worker():
     """PRECACHE is hand-maintained; a module missing from it breaks offline."""
     sw = (_REPO / "static" / "sw.js").read_text(encoding="utf-8")
