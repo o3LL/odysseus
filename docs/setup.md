@@ -500,15 +500,17 @@ Cloudflare Access, Tailscale, Caddy, nginx, and Traefik can all fit this pattern
 #### Faster over the network: HTTP/2
 
 The frontend is raw ES modules with no bundler, so a page load is a few hundred
-small same-origin requests. Over HTTP/1.1 browsers cap concurrency at 6
-connections per origin, so those requests serialise into dozens of sequential
-round trips. On localhost that costs almost nothing. Over a LAN, VPN, or any
-remote link it dominates load time, and it gets worse the higher the latency.
+small same-origin requests. Over HTTP/1.1 browsers typically allow only a small
+number of concurrent connections per host (commonly around six), so many of
+those requests are serialized across multiple round trips. On localhost that
+costs almost nothing. Over a LAN, VPN, or remote link it can become a major
+part of load time, especially as latency increases.
 
 HTTP/2 multiplexes them onto one connection and the serialisation disappears.
 Odysseus needs no changes for this — uvicorn keeps speaking HTTP/1.1 on
-loopback and the proxy speaks HTTP/2 to the browser. Browsers only negotiate
-HTTP/2 over TLS, so a certificate is required; there is no cleartext path. The
+loopback and the proxy speaks HTTP/2 to the browser. Mainstream browsers
+negotiate HTTP/2 for normal web pages over TLS; they do not use the cleartext
+h2c mode here, so browser-facing HTTP/2 requires a certificate. The
 `--ssl-certfile` route in *HTTPS + LAN/Tailscale exposure* above gives you
 HTTPS but not HTTP/2 — uvicorn does not speak it.
 
@@ -636,9 +638,12 @@ arrives token by token; add `flush_interval -1` inside the `reverse_proxy`
 block if you want that pinned explicitly. nginx needs `proxy_buffering off;`
 for the same reason.
 
-Changing the external origin also resets anything scoped to the old one: the
-service worker and its caches do not carry over, so the first load is cold, and
-session cookies do not carry over, so expect one re-login.
+Changing the external origin also affects state scoped to it. Service workers
+and their caches are origin-scoped, so moving to a different origin starts with
+a cold load. Cookies follow their own domain/path/security rules rather than
+being port-scoped: changing the hostname normally requires a new login, while
+changing only the scheme or port does not by itself guarantee that existing
+cookies disappear.
 
 Common internal-only ports from the default docs/compose setup:
 
