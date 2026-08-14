@@ -180,40 +180,27 @@ def test_redirect_base_accepts_app_public_url_as_the_alias(monkeypatch):
 
 # ── Paste-back form origin ────────────────────────────────────────
 
-def _authorize_page(scheme):
+def _authorize_page():
     from routes.mcp.mcp_routes import _oauth_authorize_page
 
     return _oauth_authorize_page(
         "https://accounts.google.com/o/oauth2/v2/auth?state=srv-1",
         "srv-1",
-        "odysseus.example.com",
         "https://odysseus.example.com/api/mcp/oauth/callback",
-        scheme,
     )
 
 
-def test_paste_back_form_posts_over_the_scheme_the_page_arrived_on():
-    # Remote users finish the flow by pasting the callback URL into this form.
-    # An http:// action on an HTTPS page is mixed content, which browsers block
-    # outright — the authorization code never reaches Odysseus.
-    assert (
-        'action="https://odysseus.example.com/api/mcp/oauth/exchange/srv-1"'
-        in _authorize_page("https")
-    )
-    assert "http://odysseus.example.com" not in _authorize_page("https")
-
-
-def test_paste_back_form_stays_on_http_for_a_plain_origin():
-    assert (
-        'action="http://odysseus.example.com/api/mcp/oauth/exchange/srv-1"'
-        in _authorize_page("http")
-    )
-
-
-def test_paste_back_form_rejects_an_unexpected_scheme():
-    # The scheme reaches the page from X-Forwarded-Proto via uvicorn's
-    # proxy-headers middleware, so it is not interpolated unchecked.
-    assert 'action="http://odysseus.example.com' in _authorize_page('javascript:"')
+def test_paste_back_form_action_is_relative():
+    # Remote users finish the flow by pasting the callback URL into this form,
+    # so it has to post back to the origin they are on. An absolute action
+    # cannot: an http:// one is mixed content on an HTTPS page and gets blocked,
+    # and the app cannot reliably tell that it is behind TLS, because uvicorn
+    # only honours X-Forwarded-Proto from a peer inside --forwarded-allow-ips
+    # (default 127.0.0.1, which a proxy on the Docker bridge is not). A relative
+    # action is resolved by the browser and is right in every one of those cases.
+    page = _authorize_page()
+    assert 'action="/api/mcp/oauth/exchange/srv-1"' in page
+    assert 'action="http' not in page
 
 
 # ── Docker configurability ────────────────────────────────────────
@@ -253,3 +240,27 @@ def test_redirect_base_override_is_documented():
     if not env_example.exists():
         pytest.skip("this checkout does not include the optional .env.example file")
     assert "# OAUTH_REDIRECT_BASE_URL=" in env_example.read_text(encoding="utf-8")
+
+
+# ── Launcher port propagation ─────────────────────────────────────
+#
+# The derived default is only as good as APP_PORT, and every launcher hands the
+# port to uvicorn as a command-line flag, which the app cannot read back. Each
+# one has to put the same value in the environment or the callback falls back to
+# 7000 — which is the macOS-launcher-on-7860 case this whole change is about.
+# internal_api_base() and companion pairing read APP_PORT too, so they go wrong
+# in the same way.
+
+_LAUNCHERS = (
+    # file, the export, the uvicorn flag it has to agree with
+    ("start-macos.sh", 'export APP_PORT="$PORT"', '--port "$PORT"'),
+    ("build-macos-app.sh", 'export APP_PORT="$PORT"', '--port "$PORT"'),
+    ("launch-windows.ps1", "$env:APP_PORT = $Port", "--port $Port"),
+)
+
+
+def test_launchers_export_the_port_they_serve_on():
+    for name, export, uvicorn_flag in _LAUNCHERS:
+        text = (_repo_root() / name).read_text(encoding="utf-8")
+        assert uvicorn_flag in text, f"{name}: launcher no longer passes {uvicorn_flag}"
+        assert export in text, f"{name}: serves on a port the app cannot read back"
