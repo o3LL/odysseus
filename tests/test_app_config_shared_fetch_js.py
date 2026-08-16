@@ -284,6 +284,72 @@ def test_out_of_band_tool_change_is_not_undone_by_an_unrelated_panel_save():
     }
 
 
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_out_of_band_tool_change_after_panel_open_is_preserved_on_save():
+    """Saving must merge the user's edit onto a fresh authoritative snapshot."""
+    body = """
+    // Panel opens while both tools are enabled.
+    __queue(__json({ tools: [
+      { id: 'web_search', enabled: true },
+      { id: 'shell', enabled: true },
+    ] }));
+    invalidateTools();
+    const panel = await getTools();
+
+    // Another tab disables web_search after this panel has already rendered.
+    __queue(__json({ tools: [
+      { id: 'web_search', enabled: false },
+      { id: 'shell', enabled: true },
+    ] }));
+
+    // The user only disables shell. Saving refreshes the authoritative state
+    // first and applies that one intended change on top of it.
+    invalidateTools();
+    const latest = await getTools();
+    const state = new Map(latest.tools.map(t => [t.id, !!t.enabled]));
+    state.set('shell', false);
+
+    const disabled = Array.from(state.entries())
+      .filter(([, enabled]) => !enabled)
+      .map(([id]) => id);
+
+    console.log(JSON.stringify({
+      panelWebSearchEnabled: panel.tools.find(t => t.id === 'web_search').enabled,
+      requests: __calls().length,
+      disabled,
+    }));
+    """
+    assert json.loads(_run(body)) == {
+        "panelWebSearchEnabled": True,
+        "requests": 2,
+        "disabled": ["web_search", "shell"],
+    }
+
+
+def test_admin_tool_save_refreshes_before_full_state_post():
+    """Pin the lost-update guard in the Admin Tools full-list writer."""
+    source = (_REPO / "static" / "js" / "admin.js").read_text(encoding="utf-8")
+    match = re.search(
+        r"async function _saveToolState\(changes\) \{(.*?)\n    \}\n"
+        r"    function _updateCatCounter",
+        source,
+        re.S,
+    )
+    assert match, "_saveToolState(changes) not found in static/js/admin.js"
+
+    body = match.group(1)
+    invalidate = body.find("invalidateTools()")
+    refresh = body.find("getTools()")
+    post = body.find("fetch('/api/tools'")
+
+    assert -1 not in (invalidate, refresh, post)
+    assert invalidate < refresh < post, (
+        "Admin Tools must invalidate and refresh authoritative tool state before "
+        "posting the endpoint's full disabled-tools replacement list"
+    )
+    assert "for (const change of changes)" in body
+
+
 def test_the_admin_tools_editor_does_not_read_a_cached_snapshot():
     """Pin the invalidate-before-read in loadBuiltinTools().
 

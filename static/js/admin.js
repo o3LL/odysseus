@@ -1979,18 +1979,44 @@ async function loadBuiltinTools() {
       });
     });
 
-    // Helper: save disabled tools + update counters
-    async function _saveToolState() {
-      const allChecks = list.querySelectorAll('input[data-tool-id]');
-      const disabled = [];
-      allChecks.forEach(c => { if (!c.checked) disabled.push(c.dataset.toolId); });
+    // Merge only the user's intended changes onto authoritative server state.
+    // /api/tools replaces the full disabled list, so rebuilding it from this
+    // panel's DOM can undo a change made by another tab or manage_settings
+    // after the panel was opened.
+    async function _saveToolState(changes) {
+      invalidateTools();
+      const latest = await getTools();
+      const state = new Map(
+        (latest.tools || []).map(t => [t.id, !!t.enabled])
+      );
+
+      for (const change of changes) {
+        if (state.has(change.id)) {
+          state.set(change.id, !!change.enabled);
+        }
+      }
+
+      const disabled = Array.from(state.entries())
+        .filter(([, enabled]) => !enabled)
+        .map(([id]) => id);
+
       try {
-        await fetch('/api/tools', {
+        const res = await fetch('/api/tools', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ disabled }),
           credentials: 'same-origin',
         });
+        if (!res.ok) throw new Error(`Failed to update tools (${res.status})`);
+
+        // Bring the still-open editor forward to the same merged snapshot so an
+        // out-of-band change is visible instead of leaving stale checkboxes.
+        list.querySelectorAll('input[data-tool-id]').forEach(c => {
+          if (state.has(c.dataset.toolId)) {
+            c.checked = state.get(c.dataset.toolId);
+          }
+        });
+        list.querySelectorAll('.admin-tool-category').forEach(_updateCatCounter);
       } finally {
         // This route persists disabled_tools into the settings store
         // (routes/model_routes.py), so both snapshots are now stale.
@@ -2011,7 +2037,9 @@ async function loadBuiltinTools() {
     // Wire individual tool toggles
     list.querySelectorAll('input[data-tool-id]').forEach(chk => {
       chk.addEventListener('change', async () => {
-        await _saveToolState();
+        await _saveToolState([
+          { id: chk.dataset.toolId, enabled: chk.checked },
+        ]);
         _updateCatCounter(chk.closest('.admin-tool-category'));
       });
     });
@@ -2022,8 +2050,10 @@ async function loadBuiltinTools() {
         const catEl = chk.closest('.admin-tool-category');
         if (!catEl) return;
         const checked = chk.checked;
+        const changes = Array.from(catEl.querySelectorAll('input[data-tool-id]'))
+          .map(c => ({ id: c.dataset.toolId, enabled: checked }));
         catEl.querySelectorAll('input[data-tool-id]').forEach(c => { c.checked = checked; });
-        await _saveToolState();
+        await _saveToolState(changes);
         _updateCatCounter(catEl);
       });
     });
