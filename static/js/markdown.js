@@ -24,6 +24,36 @@ const KATEX_CSS = '/static/lib/katex/katex.min.css';
 // load that never completes degrades to plain text rather than to nothing.
 const MATH_PENDING_CLASS = 'ody-math-pending';
 
+// KaTeX has no entity syntax: it reads a bare "&" as an alignment marker and
+// errors out on anything that is not a valid column break, so "a &lt; b" comes
+// back as a red .katex-error instead of a formula. mdToHtml escapes the whole
+// string before the math pass, which leaves two spellings of the same
+// character at the delimiters — a typed "<" arrives as "&lt;", while a typed
+// "&lt;" arrives as "&amp;lt;" — and both have to reach KaTeX as "<".
+//
+// One alternation, longest form first, so nothing this writes is scanned
+// again. Chained .replace() calls cannot do it: unescaping "&amp;" first lets
+// the next pass eat the "&lt;" it just produced (the double-unescape CodeQL
+// flags), and unescaping it last leaves the entity spelling intact and breaks
+// the render. The code-block pass upstream keeps its chained order on purpose
+// — Markdown does not decode entities inside code, so "&lt;" there is meant to
+// stay visible.
+const MATH_SOURCE_ENTITY_RE = /&amp;(?:lt|gt|amp|quot|#39);|&lt;|&gt;|&amp;/g;
+const MATH_SOURCE_ENTITIES = {
+  '&amp;lt;': '<',
+  '&amp;gt;': '>',
+  '&amp;amp;': '&',
+  '&amp;quot;': '"',
+  '&amp;#39;': "'",
+  '&lt;': '<',
+  '&gt;': '>',
+  '&amp;': '&',
+};
+
+function decodeMathSource(text) {
+  return String(text).replace(MATH_SOURCE_ENTITY_RE, (entity) => MATH_SOURCE_ENTITIES[entity]);
+}
+
 let _mermaidPromise = null;
 let _katexPromise = null;
 let _mathFlushScheduled = false;
@@ -727,10 +757,7 @@ export function mdToHtml(src, opts) {
   // Typeset straight away when KaTeX is already in, otherwise bank the source in
   // an inert placeholder for renderMath() to swap once the library lands.
   const pushMath = (math, displayMode) => {
-    // Unescape &amp; LAST, matching the code-block pass above. Doing it first
-    // double-unescapes: a literal "&lt;" reaches here as "&amp;lt;", becomes
-    // "&lt;" on the & pass, and then collapses to "<" on the next one.
-    const raw = math.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').trim();
+    const raw = decodeMathSource(math).trim();
     const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
     if (window.katex) {
       mathBlocks.push(katex.renderToString(raw, { displayMode, throwOnError: false }));

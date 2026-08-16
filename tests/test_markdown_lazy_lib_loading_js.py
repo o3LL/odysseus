@@ -42,6 +42,24 @@ def _katex_fonts_block(sw_source: str) -> str:
 # only way to observe that a second call reuses the first fetch.
 _HARNESS = r"""
 import fs from 'node:fs';
+import vm from 'node:vm';
+
+// The vendored KaTeX build itself, not a stand-in. A fake renderer that echoes
+// its input cannot tell "a < b" from "a &lt; b" — real KaTeX reads the "&" as
+// an alignment marker and returns a .katex-error span, which is the whole
+// point of the entity tests below. renderToString needs no DOM, so a bare vm
+// context is enough and keeps the library off the harness globals until a test
+// installs it deliberately.
+function loadRealKatex() {
+  const context = { console };
+  context.window = context;
+  context.self = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync('./static/lib/katex/katex.min.js', 'utf8'), context);
+  if (!context.katex) throw new Error('vendored katex.min.js did not define a katex global');
+  return context.katex;
+}
 
 const injected = { scripts: [], links: [] };
 
@@ -292,27 +310,56 @@ def test_deferred_math_schedules_a_katex_load(node_available):
     assert out["scriptSrcs"] == [KATEX_SRC]
 
 
-def test_math_entities_are_not_double_unescaped(node_available):
-    """A literal "&lt;" in math must survive as "&lt;", not collapse to "<".
+def test_entity_math_reaches_katex_as_characters_not_entities(node_available):
+    """"$a &lt; b$" and "$a < b$" must typeset the same, with no parse error.
 
-    mdToHtml escapes the source before the math pass, so the user's "&lt;"
-    arrives as "&amp;lt;". Unescaping "&amp;" first turns it back into "&lt;"
-    and the very next pass eats it, which is the same double-unescape the
-    code-block pass already avoids by unescaping "&amp;" last.
+    mdToHtml escapes the source before the math pass, so a typed "<" arrives at
+    the delimiters as "&lt;" and a typed "&lt;" arrives as "&amp;lt;". KaTeX
+    has no entity syntax and treats the "&" as an alignment marker, so anything
+    still spelled as an entity comes back as a red .katex-error instead of a
+    formula. Both spellings have to be decoded to the character itself, in one
+    pass — decoding "&amp;" first and "&lt;" after would let the second pass eat
+    what the first produced, which is the double-unescape CodeQL flags.
     """
     out = _run_node(
         """
-        globalThis.window.katex = { renderToString: (src) => `<K>${src}</K>` };
-        globalThis.katex = globalThis.window.katex;
+        const katex = loadRealKatex();
+        globalThis.window.katex = katex;
+        globalThis.katex = katex;
         emit({
           entity: mod.mdToHtml('Math: $a &lt; b$ done.'),
-          realLt: mod.mdToHtml('Math: $a < b$ done.'),
+          typed: mod.mdToHtml('Math: $a < b$ done.'),
+          ampersandEntity: mod.mdToHtml('Math: $x &gt; y$ done.'),
         });
         """
     )
-    assert "<K>a &lt; b</K>" in out["entity"]
-    # A genuinely typed "<" is untouched by the reorder.
-    assert "<K>a < b</K>" in out["realLt"]
+    assert "katex-error" not in out["entity"]
+    assert "katex-error" not in out["typed"]
+    assert "katex-error" not in out["ampersandEntity"]
+    # Same formula, same markup, whichever way the author spelled the operator.
+    assert out["entity"] == out["typed"]
+    assert 'class="katex"' in out["entity"]
+
+
+def test_deferred_entity_math_banks_the_decoded_source(node_available):
+    """The placeholder has to hold the same source the inline path would use.
+
+    renderMath() feeds the span's textContent straight to KaTeX, so an entity
+    left in the bank is a .katex-error that only appears on a cold page — the
+    exact case the lazy load made common.
+    """
+    out = _run_node(
+        """
+        emit({
+          entity: mod.mdToHtml('Math: $a &lt; b$ done.'),
+          typed: mod.mdToHtml('Math: $a < b$ done.'),
+        });
+        """
+    )
+    assert 'class="ody-math-pending"' in out["entity"]
+    assert out["entity"] == out["typed"]
+    # Escaped once for transport, so the span's textContent is "a < b".
+    assert "a &lt; b</span>" in out["entity"]
 
 
 def test_md_to_html_renders_inline_once_katex_is_loaded(node_available):
