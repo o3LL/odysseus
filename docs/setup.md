@@ -486,6 +486,14 @@ Odysseus is a self-hosted workspace with powerful local tools: shell access, fil
 - Keep ChromaDB, SearXNG, ntfy, Ollama, vLLM, llama.cpp, databases, and raw model/provider APIs internal-only. Expose only the authenticated Odysseus web/API entrypoint through your trusted proxy or private access layer.
 - Before publishing a fork, run `git status --short` and confirm no private files from `.env`, `data/`, `logs/`, uploads, backups, or local databases are staged.
 
+> **Upgrading an existing install:** `SECURE_COOKIES` used to default to
+> `false`, so an install set up before scheme derivation may still carry
+> `SECURE_COOKIES=false` in its own `.env`. That explicit value stays
+> authoritative, so HTTPS logins keep getting a non-`Secure` session cookie.
+> Pulling this change updates the tracked Compose files, but nothing rewrites
+> your `.env` — drop the line from it unless you deliberately serve plain HTTP
+> alongside HTTPS and want the escape hatch.
+
 ### Private or proxied deployments
 Odysseus serves plain HTTP on its app port. Docker Compose binds Odysseus and the bundled services to `127.0.0.1` by default, so a typical production/private setup is:
 
