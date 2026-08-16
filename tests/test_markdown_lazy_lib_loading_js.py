@@ -362,6 +362,56 @@ def test_deferred_entity_math_banks_the_decoded_source(node_available):
     assert "a &lt; b</span>" in out["entity"]
 
 
+def test_detached_container_math_typesets_with_the_real_renderer(node_available):
+    """The PDF export renders into a container it never attaches to the page.
+
+    mdToHtml defers math to a document-scoped flush, which cannot reach a
+    detached node, so the export has to typeset its own container before
+    handing it to html2pdf. This is that container: pending spans in, real
+    KaTeX markup out, no .katex-error and nothing left pending.
+    """
+    out = _run_node(
+        """
+        const katex = loadRealKatex();
+        const html = mod.mdToHtml('Formula $E = mc^2$ here.');
+
+        const el = makeEl('span');
+        el.textContent = 'E = mc^2';
+        el.getAttribute = (name) => (name === 'data-display' ? 'false' : null);
+        let written = null;
+        Object.defineProperty(el, 'outerHTML', { set(v) { written = v; } });
+        const container = makeContainer({ '.ody-math-pending': [el] });
+
+        const pending = mod.renderMath(container);
+        globalThis.window.katex = katex;
+        injected.scripts[0].fire('load');
+        injected.links[0].fire('load');
+        await pending;
+
+        emit({ html, written });
+        """
+    )
+    # Cold page: mdToHtml could not typeset, so the export HTML starts pending.
+    assert 'class="ody-math-pending"' in out["html"]
+    # After the export's own render pass it is real KaTeX markup.
+    assert 'class="katex"' in out["written"]
+    assert "katex-error" not in out["written"]
+    assert "ody-math-pending" not in out["written"]
+
+
+def test_pdf_export_typesets_its_container_before_html2pdf():
+    """Ordering in a call site, so pin the call site. No node needed."""
+    source = (_REPO / "static/js/document.js").read_text(encoding="utf-8")
+    match = re.search(r"\n  async function exportAsPdf\(\) \{(.*?)\n  \}\n", source, re.S)
+    assert match, "exportAsPdf not found"
+    body = match.group(1)
+
+    render = "await markdownModule.renderMath(container);"
+    assert render in body, "the export never typesets its detached container"
+    assert body.index("container.innerHTML = html;") < body.index(render)
+    assert body.index(render) < body.index("window.html2pdf()")
+
+
 def test_md_to_html_renders_inline_once_katex_is_loaded(node_available):
     """After the first load mdToHtml goes back to typesetting synchronously."""
     out = _run_node(
