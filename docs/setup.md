@@ -590,9 +590,12 @@ Odysseus's own service is unchanged; the proxy runs alongside it. Under Docker,
 run the proxy as another container, or on the host pointing at the published
 port.
 
-**4. Point Odysseus at the new origin** in `.env`, then restart it:
+**4. Point Odysseus at the new origin** in `.env`, then restart it.
+
+A proxy that exposes the HTTPS request scheme to Odysseus needs no `SECURE_COOKIES` setting. Only force it on when the proxy cannot expose that scheme:
 
 ```bash
+# only if the proxy cannot expose the external HTTPS scheme to Odysseus:
 SECURE_COOKIES=true
 # only if you use remote MCP servers with OAuth:
 OAUTH_REDIRECT_BASE_URL=https://odysseus.example.com
@@ -627,10 +630,12 @@ enable it by right-clicking the column headers.
 
 Three things bite when moving an existing install behind TLS:
 
-- Set `SECURE_COOKIES=true` **at the same time** you stop serving plain HTTP,
-  not before. The flag is applied to every login regardless of the scheme the
-  request arrived on, so while an HTTP entrypoint is still reachable the
-  browser will reject the `Secure` cookie there and login will appear to loop.
+- Leave `SECURE_COOKIES` unset when Odysseus can see the external HTTPS scheme;
+  the cookie then follows the request automatically. If your proxy cannot expose
+  that scheme, set `SECURE_COOKIES=true` **at the same time** you stop serving
+  plain HTTP, not before. An explicit `true` applies to every login, so while an
+  HTTP entrypoint is still reachable the browser will reject the `Secure` cookie
+  there and login will appear to loop.
 - `OAUTH_REDIRECT_BASE_URL` defaults to `http://localhost:7000`. Unlike the
   Gmail redirect URI it cannot be derived from a request — it is registered
   with each MCP authorization server up front — so set it to the external
