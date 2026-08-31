@@ -57,10 +57,36 @@ function Assert-Sha256 {
     return $actual
 }
 
+function Get-CertificateSubjectPart {
+    param(
+        [Parameter(Mandatory = $true)] $Certificate,
+        [Parameter(Mandatory = $true)][string] $Rdn
+    )
+
+    # Do not substring-match a distinguished name. X.500 quotes any value that
+    # contains the separator, so Chocolatey's certificate reads
+    # O="Chocolatey Software, Inc" while Microsoft's reads O=Microsoft
+    # Corporation -- an "*O=<name>*" pattern silently never matches the first.
+    # Decoding with UseNewLines gives one RDN per line; the quotes survive that,
+    # so strip them here.
+    $flags = [System.Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::UseNewLines
+    foreach ($line in ($Certificate.SubjectName.Decode($flags) -split "`r?`n")) {
+        $line = $line.Trim()
+        if ($line -match "^$Rdn\s*=\s*(.+)$") {
+            $value = $matches[1].Trim()
+            if ($value.Length -ge 2 -and $value.StartsWith('"') -and $value.EndsWith('"')) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+            return $value
+        }
+    }
+    return $null
+}
+
 function Assert-Signature {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][string] $ExpectedSubject,
+        [Parameter(Mandatory = $true)][string] $ExpectedOrganisation,
         [Parameter(Mandatory = $true)][string] $What
     )
 
@@ -70,10 +96,11 @@ function Assert-Signature {
     }
 
     $subject = $signature.SignerCertificate.Subject
-    if ($subject -notlike $ExpectedSubject) {
-        throw ("{0} is signed by an unexpected publisher.`n  expected: {1}`n  actual  : {2}" -f $What, $ExpectedSubject, $subject)
+    $organisation = Get-CertificateSubjectPart -Certificate $signature.SignerCertificate -Rdn "O"
+    if ($organisation -ne $ExpectedOrganisation) {
+        throw ("{0} is signed by an unexpected publisher.`n  expected O: {1}`n  actual   O: {2}`n  full subject: {3}" -f $What, $ExpectedOrganisation, $organisation, $subject)
     }
-    Write-Host "[+] $What signature verified ($subject)."
+    Write-Host "[+] $What signature verified (O=$organisation)."
     return $subject
 }
 
@@ -143,11 +170,15 @@ if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
     # The bootstrap script is served from a rolling URL, so its digest cannot be
     # pinned. Its Authenticode signature can be, and the version it installs is
     # asserted below.
-    Assert-Signature -Path $chocoInstaller -ExpectedSubject "*O=Chocolatey Software, Inc*" -What "Chocolatey bootstrap script" | Out-Null
+    Assert-Signature -Path $chocoInstaller -ExpectedOrganisation "Chocolatey Software, Inc" -What "Chocolatey bootstrap script" | Out-Null
 
     $env:chocolateyVersion = $ChocolateyVersion
+    # No $LASTEXITCODE check here: that variable reflects the last *native*
+    # command, so a script that ends without running one leaves a stale or unset
+    # value and a zero-exit bootstrap can look like a failure.
+    # ErrorActionPreference=Stop propagates a real failure, and the version
+    # assertion below is the actual gate.
     & $chocoInstaller
-    if ($LASTEXITCODE -ne 0) { throw "Chocolatey bootstrap failed with code $LASTEXITCODE." }
     Remove-Item $chocoInstaller -Force
     $env:PATH += ";$env:ALLUSERSPROFILE\chocolatey\bin"
 } else {
@@ -168,11 +199,22 @@ foreach ($entry in ($ChocolateyPackages -split ",")) {
     $packagePins[$parts[0].Trim()] = $parts[1].Trim()
 }
 
+# 0 is plain success. 3010 and 1641 are "succeeded, reboot required" -- the
+# Visual Studio build tools return 3010 routinely, and treating that as a
+# failure would abort a provision that actually worked.
+$rebootExitCodes = @(1641, 3010)
+$rebootPending = $false
+
 foreach ($name in $packagePins.Keys) {
     $version = $packagePins[$name]
     Write-Host "[*] choco install $name $version"
     & choco install $name --version=$version --require-checksums -y --no-progress --limit-output
-    if ($LASTEXITCODE -ne 0) { throw "choco install $name $version failed with code $LASTEXITCODE." }
+    if ($rebootExitCodes -contains $LASTEXITCODE) {
+        $rebootPending = $true
+        Write-Host "[*] '$name' installed and asked for a reboot (exit $LASTEXITCODE)."
+    } elseif ($LASTEXITCODE -ne 0) {
+        throw "choco install $name $version failed with code $LASTEXITCODE."
+    }
 }
 
 # Refresh environment so new binaries are on PATH. refreshenv only exists once
@@ -210,12 +252,18 @@ if (-not (Get-Command rustc -ErrorAction SilentlyContinue)) {
         -OutFile $rustup -UseBasicParsing
     Assert-Sha256 -Path $rustup -Expected $RustupSha256 -What "rustup-init.exe $RustupVersion" | Out-Null
 
-    Start-Process -FilePath $rustup -Wait -ArgumentList @(
+    # -PassThru so the exit code is actually inspected; Start-Process -Wait on
+    # its own reports nothing and a failed install would only surface later as a
+    # confusing "rustc not found".
+    $rustupRun = Start-Process -FilePath $rustup -Wait -PassThru -ArgumentList @(
         "-y",
         "--no-modify-path",
         "--profile", "minimal",
         "--default-toolchain", $RustToolchain
     )
+    if ($rustupRun.ExitCode -ne 0) {
+        throw "rustup-init.exe failed with exit code $($rustupRun.ExitCode) while installing $RustToolchain."
+    }
     Remove-Item $rustup -Force
 } else {
     Write-Host "[*] Rust already installed."
@@ -238,7 +286,7 @@ if (-not $wv2Reg) {
     Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $wv2 -UseBasicParsing
     # The evergreen bootstrapper is deliberately a moving target, so it is
     # verified by publisher rather than by digest.
-    $webview2Subject = Assert-Signature -Path $wv2 -ExpectedSubject "*O=Microsoft Corporation*" -What "WebView2 bootstrapper"
+    $webview2Subject = Assert-Signature -Path $wv2 -ExpectedOrganisation "Microsoft Corporation" -What "WebView2 bootstrapper"
     Start-Process -FilePath $wv2 -ArgumentList "/silent /install" -Wait
     Remove-Item $wv2 -Force
 } else {
@@ -319,6 +367,12 @@ Write-Host "[+] Release frontend entry present: $frontendEntry"
 # -----------------------------------------------------------------
 # 8. Build release binary + installer
 # -----------------------------------------------------------------
+if ($rebootPending) {
+    Write-Host "[*] A package asked for a reboot. Attempting the build anyway; if the"
+    Write-Host "    MSVC linker is not found, run 'vagrant reload' and then"
+    Write-Host "    'vagrant provision --provision-with build'."
+}
+
 Push-Location "$CloneDir\src-tauri"
 try {
     Write-Host "[*] Building Odysseus Tauri launcher (release, bundle: $BundleTarget) ..." -ForegroundColor Cyan
@@ -415,6 +469,7 @@ $receipt = [ordered]@{
     }
     packages = $packageReport
     release = [ordered]@{
+        rebootPending = $rebootPending
         frontendDist  = $frontendDist
         frontendEntry = $frontendEntry
         bundleTarget  = $BundleTarget
