@@ -14,7 +14,7 @@ This is a **smoke-test harness**. It exists so a reviewer can build the launcher
 
 | | |
 |---|---|
-| **Does** | Build from an exact commit, with every tool and package version pinned and asserted before use |
+| **Does** | Build from an exact commit, with every tool and package version pinned and asserted before use (with the two exceptions below) |
 | **Does** | Produce the portable `odysseus.exe` and the NSIS installer, and fail the build if either is missing |
 | **Does** | Write a build receipt recording every input identity and every artefact digest |
 | **Does not** | Code-sign or timestamp anything - both artefacts are unsigned and Windows SmartScreen will say so |
@@ -35,13 +35,21 @@ Everything is declared once, at the top of the `Vagrantfile`. `vagrant/provision
 | VM image | `gusztavvargadr/windows-11` `2607.1.0`, `amd64`, `box_check_update = false` | Vagrant verifies the image against the published SHA-256 for that version on download; the digest is repeated in the `Vagrantfile` and recorded in the receipt |
 | Source | Full 40-character commit SHA | Fetched by object id, then `git rev-parse HEAD` is compared against the pin |
 | Chocolatey client | Exact version via `$env:chocolateyVersion` | Bootstrap script's Authenticode publisher checked, then `choco --version` compared |
-| Chocolatey packages | Exact `--version=` per package, `--require-checksums` | `choco list` compared against every pin after install |
+| Chocolatey packages | Exact `--version=` per package, `--require-checksums` (see the exception below) | `choco list` compared against every pin after install |
+| MSVC toolset | Not pinned - see below | `vswhere` must report `VC.Tools.x86.x64`; the version that landed is recorded in the receipt |
 | rustup | Versioned archive URL, not `win.rustup.rs` | SHA-256 of the downloaded `rustup-init.exe` |
 | Rust toolchain | Exact `--default-toolchain` | `rustc --version` compared |
 | `tauri-cli` | Exact `--version`, `--locked` | `cargo tauri --version` compared |
 | WebView2 | Evergreen bootstrapper (deliberately a moving target) | Authenticode publisher must be Microsoft Corporation |
 
 A branch name is rejected as a source pin: it does not pin anything.
+
+### Where the pinning stops
+
+Two gaps that the table above would otherwise paper over:
+
+- **The Visual Studio packages are exempt from `--require-checksums`.** Their install script fetches the release channel manifest from `https://aka.ms/vs/17/release/channel`, a live document that can never carry a static checksum, so Chocolatey fails the package outright under checksum enforcement. The exemption is by package name, keeps the HTTPS requirement (`--allow-empty-checksums-secure`, not `--allow-empty-checksums`), and is recorded per package in the receipt as `checksumPolicy`.
+- **Pinning the Chocolatey package version does not pin the MSVC toolset.** `visualstudio2022buildtools` is a thin wrapper around Microsoft's bootstrapper, which installs whatever the current channel says. The same applies to the transitive packages Chocolatey pulls in along the way (`dotnetfx`, `visualstudio-installer`, the `chocolatey-*.extension` packages, and the KB packages behind `vcredist140`) - those install at whatever version is current. The harness cannot close that, so instead it asserts the toolset is actually usable via `vswhere` and records the version that landed in the receipt, which makes a run auditable after the fact rather than reproducible in advance.
 
 ### Build receipt
 
@@ -163,6 +171,8 @@ The launcher runs as `OdysseusUser`, so any UAC prompts or privilege-escalation 
 | `vagrant up` hangs | The Windows image is large (~7 GB download) and initial boot can take 20-30 min on first run. |
 | `The box ... could not be found` / no matching provider | Check your Vagrant is 2.4+ and your host is x86-64. The pinned box publishes an `amd64` VirtualBox image only. |
 | Provisioning fails with "does not match its pin" | A pinned version has been yanked or replaced upstream. Update the value in the `Vagrantfile`; do not remove the assertion. |
+| Provisioning fails with "MSVC x64 build tools are not usable" | The toolset install did not complete. Usually a pending reboot: `vagrant reload`, then `vagrant provision --provision-with build`. |
+| A package fails with "does not yet have package checksums" | Upstream stopped publishing a checksum for something the package downloads. Add the package to `$checksumExempt` in `provision-build.ps1` only if the download is over HTTPS, and note it in the section above. |
 | Provisioning fails with "produced no installer executable" | The NSIS bundling step failed. Read the `cargo tauri build` output above the error - it is the actual failure. |
 | Provisioning fails with "build.frontendDist points at ..." | The commit you pinned does not carry the frontend assets its release config references. That is a defect in the source, not in the harness; it is reported rather than patched over. |
 | WebView2 window is blank / black | Ensure the VM has at least 128 MB video RAM (set in the `Vagrantfile`) and the VirtualBox display adapter is VBoxSVGA or VMSVGA. |

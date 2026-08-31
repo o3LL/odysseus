@@ -205,10 +205,34 @@ foreach ($entry in ($ChocolateyPackages -split ",")) {
 $rebootExitCodes = @(1641, 3010)
 $rebootPending = $false
 
+# --require-checksums is the default, but it cannot hold for the Visual Studio
+# packages: their install script fetches the release channel manifest from
+# https://aka.ms/vs/17/release/channel, which is a live document by design and
+# so can never carry a static checksum. Chocolatey fails the package outright.
+# The exemption is named rather than global, keeps the HTTPS requirement
+# (--allow-empty-checksums-secure, not --allow-empty-checksums), and is recorded
+# in the build receipt so the weaker policy is visible rather than assumed.
+$checksumExempt = @("visualstudio2022buildtools", "visualstudio2022-workload-vctools")
+$checksumPolicy = [ordered]@{}
+
 foreach ($name in $packagePins.Keys) {
     $version = $packagePins[$name]
-    Write-Host "[*] choco install $name $version"
-    & choco install $name --version=$version --require-checksums -y --no-progress --limit-output
+    # [string[]] is load-bearing. This array is splatted into the choco command
+    # line, and splatting a bare string explodes it one character per argument,
+    # so the type constraint keeps a future single-flag edit from silently
+    # producing "- - r e q u i r e ...".
+    [string[]] $checksumArgs = @()
+    if ($checksumExempt -contains $name) {
+        $checksumArgs = @("--allow-empty-checksums-secure")
+        $checksumPolicy[$name] = "empty-allowed-https"
+        Write-Host "[*] choco install $name $version (checksums not available upstream; HTTPS still required)"
+    } else {
+        $checksumArgs = @("--require-checksums")
+        $checksumPolicy[$name] = "required"
+        Write-Host "[*] choco install $name $version"
+    }
+
+    & choco install $name --version=$version @checksumArgs -y --no-progress --limit-output
     if ($rebootExitCodes -contains $LASTEXITCODE) {
         $rebootPending = $true
         Write-Host "[*] '$name' installed and asked for a reboot (exit $LASTEXITCODE)."
@@ -239,6 +263,28 @@ foreach ($name in $packagePins.Keys) {
     }
     Assert-VersionMatch -Expected $packagePins[$name] -Actual $installedPackages[$name] -What "Chocolatey package '$name'"
 }
+
+# Chocolatey's bookkeeping says a package is registered; it does not say the
+# MSVC toolset is usable. Ask vswhere, which is what the Rust MSVC target will
+# look for, so a missing or half-installed toolset fails here rather than as a
+# cryptic linker error forty minutes into the cargo build.
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+$msvcInstall = $null
+if (Test-Path -LiteralPath $vswhere) {
+    $vswhereJson = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -latest -format json
+    if ($vswhereJson) { $msvcInstall = @($vswhereJson | ConvertFrom-Json) | Select-Object -First 1 }
+}
+if (-not $msvcInstall) {
+    throw @"
+The MSVC x64 build tools are not usable after installing the pinned packages.
+  vswhere: $vswhere
+Chocolatey reported success, but the component the Rust MSVC target needs
+(Microsoft.VisualStudio.Component.VC.Tools.x86.x64) is not installed.
+If a package asked for a reboot, run 'vagrant reload' and then
+'vagrant provision --provision-with build'.
+"@
+}
+Write-Host "[+] MSVC build tools present: $($msvcInstall.displayName) $($msvcInstall.installationVersion)"
 
 # -----------------------------------------------------------------
 # 3. Rustup + exact toolchain
@@ -434,8 +480,9 @@ foreach ($file in (Get-ChildItem -LiteralPath $DeployDir -Filter "*.exe" -File))
 $packageReport = [ordered]@{}
 foreach ($name in $packagePins.Keys) {
     $packageReport[$name] = [ordered]@{
-        pinned    = $packagePins[$name]
-        installed = $installedPackages[$name]
+        pinned         = $packagePins[$name]
+        installed      = $installedPackages[$name]
+        checksumPolicy = $checksumPolicy[$name]
     }
 }
 
@@ -466,6 +513,10 @@ $receipt = [ordered]@{
         tauriCli         = $tauriCliActual
         chocolatey       = $chocoActual
         webview2Publisher = $webview2Subject
+        # The Chocolatey package version pins the wrapper, not the toolset it
+        # fetches from Microsoft's live channel. Record what actually landed.
+        msvcProduct      = $msvcInstall.displayName
+        msvcVersion      = $msvcInstall.installationVersion
     }
     packages = $packageReport
     release = [ordered]@{
