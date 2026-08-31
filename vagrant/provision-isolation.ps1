@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 
 Write-Host "[*] Hardening VM isolation..." -ForegroundColor Cyan
 
-# 1. Firewall – block inbound, log blocked packets
+# 1. Firewall - block inbound, log blocked packets
 $logDir = "C:\Windows\system32\LogFiles\Firewall"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
