@@ -785,7 +785,9 @@ def _apply_patch_hunks(original: str, hunks: List[List[str]], label: str) -> str
 
 class LsTool:
     async def execute(self, content: str, ctx: dict) -> dict:
-        from src.tool_execution import _display_tool_path, _is_denied_tool_path, _resolve_search_root, _truncate
+        from src.tool_execution import (
+            _display_tool_path, _is_denied_tool_path, _resolve_search_root, _truncate, tool_scan_snapshot,
+        )
         raw_path = ""
         _s = (content or "").strip()
         if _s.startswith("{"):
@@ -804,12 +806,14 @@ class LsTool:
             if not os.path.isdir(root):
                 return None, f"ls: {root}: not a directory"
             rows = []
+            snapshot = tool_scan_snapshot()
             try:
                 with os.scandir(root) as it:
                     for entry in it:
                         if entry.name.startswith("."):
                             continue
-                        if _is_denied_tool_path(os.path.realpath(entry.path)) or not _visible_bound_resource(entry.path):
+                        if (_is_denied_tool_path(os.path.realpath(entry.path), snapshot=snapshot)
+                                or not _visible_bound_resource(entry.path)):
                             continue
                         try:
                             is_dir = entry.is_dir(follow_symlinks=False)
@@ -845,6 +849,7 @@ class GlobTool:
             _resolve_tool_path,
             _resolve_search_root,
             _truncate,
+            tool_scan_snapshot,
         )
         args = {}
         _s = (content or "").strip()
@@ -868,6 +873,7 @@ class GlobTool:
             if not os.path.isdir(base):
                 return None, f"glob: {root}: not a directory"
             rbase = os.path.realpath(base)
+            snapshot = tool_scan_snapshot()
             norm_pat = pattern.replace("\\", "/")
             # Fast path: literal pattern (no wildcards) → direct path lookup.
             if not any(c in norm_pat for c in "*?["):
@@ -884,7 +890,8 @@ class GlobTool:
                 # .ssh/id_rsa, …) falls through to the walk, which skips it —
                 # otherwise glob would surface secret paths that read_file /
                 # grep already refuse to touch.
-                if inside and os.path.exists(cand) and not _is_denied_tool_path(cand) and _visible_bound_resource(cand):
+                if (inside and os.path.exists(cand) and not _is_denied_tool_path(cand, snapshot=snapshot)
+                        and _visible_bound_resource(cand)):
                     return [cand], None
                 # Literal not at exact path — fall through to walk so
                 # e.g. "foo.py" still matches at any depth (like rglob).
@@ -894,7 +901,7 @@ class GlobTool:
             cap = _CODENAV_MAX_HITS * 5
             try:
                 for dp, dns, fns in os.walk(base):
-                    if not _can_traverse_tool_path(os.path.realpath(dp)):
+                    if not _can_traverse_tool_path(os.path.realpath(dp), snapshot=snapshot):
                         dns[:] = []
                         continue
                     # Prune skipped dirs before descending (unlike rglob which
@@ -905,7 +912,7 @@ class GlobTool:
                         d for d in dns
                         if d not in _CODENAV_SKIP_DIRS
                         and d not in _SENSITIVE_BASENAMES
-                        and _can_traverse_tool_path(os.path.realpath(os.path.join(dp, d)))
+                        and _can_traverse_tool_path(os.path.realpath(os.path.join(dp, d)), snapshot=snapshot)
                     ]
                     for name in fns + dns:
                         full = os.path.join(dp, name)
@@ -913,7 +920,8 @@ class GlobTool:
                         if regex.fullmatch(rel) or regex.fullmatch(name):
                             # Skip deny-listed sensitive files (.env, id_rsa,
                             # known_hosts, …) the same way grep does.
-                            if _is_denied_tool_path(os.path.realpath(full)) or not _visible_bound_resource(full):
+                            if (_is_denied_tool_path(os.path.realpath(full), snapshot=snapshot)
+                                    or not _visible_bound_resource(full)):
                                 continue
                             try:
                                 mtime = os.stat(full).st_mtime
@@ -950,6 +958,7 @@ class GrepTool:
             _path_within,
             _resolve_search_root,
             _truncate,
+            tool_scan_snapshot,
         )
         args: Dict[str, Any] = {}
         _s = (content or "").strip()
@@ -992,6 +1001,7 @@ class GrepTool:
             if bound is not None:
                 bound.validate()
             files = []
+            snapshot = tool_scan_snapshot()
 
             def check_deadline():
                 if time.monotonic() >= deadline:
@@ -1002,7 +1012,7 @@ class GrepTool:
                 if os.path.islink(path):
                     return
                 canonical = os.path.realpath(path)
-                if not _path_within(canonical, base) or _is_denied_tool_path(canonical):
+                if not _path_within(canonical, base) or _is_denied_tool_path(canonical, snapshot=snapshot):
                     return
                 if bound is not None:
                     try:
@@ -1037,7 +1047,7 @@ class GrepTool:
                     while pending_directories:
                         check_deadline()
                         directory = pending_directories.pop()
-                        if not _can_traverse_tool_path(directory):
+                        if not _can_traverse_tool_path(directory, snapshot=snapshot):
                             continue
                         with os.scandir(directory) as entries:
                             for entry in entries:
@@ -1052,8 +1062,8 @@ class GrepTool:
                                     raise ValueError("grep: directory identity changed during enumeration")
                                 if entry.is_dir(follow_symlinks=False):
                                     if (entry.name not in _CODENAV_SKIP_DIRS
-                                            and _can_traverse_tool_path(canonical)
-                                            and (bound is None or _is_denied_tool_path(canonical)
+                                            and _can_traverse_tool_path(canonical, snapshot=snapshot)
+                                            and (bound is None or _is_denied_tool_path(canonical, snapshot=snapshot)
                                                  or _visible_bound_resource(canonical))):
                                         pending_directories.append(canonical)
                                 else:
