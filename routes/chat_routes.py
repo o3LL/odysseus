@@ -81,6 +81,7 @@ from src.tool_policy import (
     WEB_TOOL_NAMES,
     build_effective_tool_policy,
     is_web_search_explicitly_denied,
+    message_avoids_web_lookup,
     web_intent_may_enable_for_turn,
     web_search_enabled_for_turn,
 )
@@ -259,14 +260,7 @@ def _is_personal_data_search_without_web_target(text: str) -> bool:
 
 
 def _explicitly_denies_web_lookup(text: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(?:no\s+web|do\s+not\s+search|don'?t\s+search|without\s+looking\s+it\s+up|"
-            r"without\s+searching|answer\s+from\s+memory\s+only|from\s+memory|"
-            r"no\s+tools?|do\s+not\s+use\s+(?:any\s+)?tools?|don'?t\s+use\s+(?:any\s+)?tools?)\b",
-            str(text or "").lower(),
-        )
-    )
+    return message_avoids_web_lookup(text) or _explicitly_denies_tool_use(text)
 
 
 def _explicitly_denies_tool_use(text: str) -> bool:

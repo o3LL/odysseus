@@ -162,6 +162,23 @@ def test_plain_web_request_still_offers_search(monkeypatch):
     assert "web_search" in _schema_names(offered[0])
 
 
+# Negating one source is not negating the web: these ask for the web and only
+# rule out notes, a site, or answering from memory.
+NEGATES_ANOTHER_SOURCE = [
+    "Don't search my notes, search the web for the 2026 F1 calendar.",
+    "Find recent news about the Gemini launch, don't search twitter.",
+    "Look it up online: opening hours for the Louvre, not from memory.",
+]
+
+
+@pytest.mark.parametrize("phrasing", NEGATES_ANOTHER_SOURCE)
+def test_negating_another_source_still_offers_search(monkeypatch, phrasing):
+    offered, chunks = _run_turn(monkeypatch, [{"role": "user", "content": phrasing}])
+
+    assert len(offered) == 1, chunks
+    assert "web_search" in _schema_names(offered[0])
+
+
 # ── supplied workspace context must not produce a clarification ─────────────
 # When the turn already carries what it needs, an answer that hands the next
 # decision back to the user is a failed turn, not a polite one. The runtime

@@ -55,6 +55,63 @@ def web_search_enabled_for_turn(allow_web_search: object, use_web: object = None
     return tool_toggle_enabled(allow_web_search) or tool_toggle_enabled(use_web)
 
 
+# A request only opts out of the web when it negates the web or searching in
+# general. "don't search my notes, search the web for X" negates one source and
+# asks for the web, so the negation must end the clause or name the web itself.
+_NO_WEB_CLAUSE_END = r"(?=\s*(?:$|[.,;:!?)\]]|please\b|just\b|and\b|but\b|thanks?\b|for\s+this\b|this\s+time\b))"
+_AVOIDS_WEB_PATTERNS = (
+    # "no web", "no web search please", "no internet access" - not "no web presence".
+    re.compile(
+        r"\bno\s+(?:web|internet|online)"
+        r"(?:\s+(?:search(?:es|ing)?|lookups?|access|browsing|tools?))?" + _NO_WEB_CLAUSE_END
+    ),
+    # "don't search", "do not search the web", "don't look it up", "do not search or fetch".
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+(?:search|google|browse|look\s+(?:it|this|that|anything)\s+up)"
+        r"(?:\s+(?:the\s+)?(?:web|internet|online|anything|for\s+(?:it|this|that|anything)))?"
+        r"(?=\s*(?:$|[.,;:!?)\]]|or\s+(?:fetch|browse|look)\b|please\b|just\b|and\b|but\b|thanks?\b))"
+    ),
+    # "don't use the web", "don't go online" - not "don't use the web version of X".
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+(?:use|go)\s+(?:the\s+)?(?:web\s+search|web|internet|online|browser)\b"
+        r"(?!\s+(?:version|app|apps|site|page|interface|client)\b)"
+    ),
+    # "without searching", "without looking it up", "without the web".
+    re.compile(
+        r"\bwithout\s+(?:searching|browsing|googling|looking\s+(?:it|this|that|anything)\s+up|"
+        r"(?:using\s+)?(?:the\s+)?(?:web\s+search|web|internet))\b"
+    ),
+)
+_FROM_MEMORY = re.compile(r"\bfrom\s+memory\b")
+_FROM_MEMORY_FOLLOWER = re.compile(
+    r"\s*(?:$|[.,;:!?)\]]|only\b|alone\b|please\b|and\b|but\b|no\b|without\b|-)"
+)
+_MEMORY_INSTRUCTION = re.compile(
+    r"\b(?:answer|respond|reply|tell\s+me|write|explain|summari[sz]e|say|list|describe|recite|"
+    r"just|only|purely|entirely|strictly)\b"
+)
+_MEMORY_NEGATION = re.compile(r"\b(?:not|never|no|cannot)\b|n't\b|\binstead\s+of\b|\brather\s+than\b")
+
+
+def _asks_to_answer_from_memory(value: str) -> bool:
+    """"Answer from memory" is an instruction; "can't recall it from memory" is not."""
+    for match in _FROM_MEMORY.finditer(value):
+        if not _FROM_MEMORY_FOLLOWER.match(value, match.end()):
+            continue  # "from memory makers", "from memory of our last chat"
+        clause = re.split(r"[.,;:!?\n]", value[max(0, match.start() - 120):match.start()])[-1]
+        if _MEMORY_NEGATION.search(clause):
+            continue  # "not from memory", "do not answer from memory"
+        if not clause.strip() or _MEMORY_INSTRUCTION.search(clause):
+            return True
+    return False
+
+
+def message_avoids_web_lookup(text: object) -> bool:
+    """Whether the user tells this turn not to use the web."""
+    value = str(text or "").lower().replace("\u2019", "'")
+    return any(pattern.search(value) for pattern in _AVOIDS_WEB_PATTERNS) or _asks_to_answer_from_memory(value)
+
+
 def web_intent_may_enable_for_turn(
     allow_web_search: object,
     *,

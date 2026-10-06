@@ -64,7 +64,13 @@ from src.tool_security import (
     email_tool_policy_names,
     plan_mode_disabled_tools,
 )
-from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy, known_tool_names
+from src.tool_policy import (
+    GUIDE_ONLY_DIRECTIVE,
+    WEB_TOOL_NAMES,
+    ToolPolicy,
+    known_tool_names,
+    message_avoids_web_lookup,
+)
 from src.client_tool_contract import TUI_CLIENT_TOOL_NAMES
 from src.tool_capabilities import (
     ResultIntegrity,
@@ -874,13 +880,7 @@ def _is_qwen38_tool_router(model: str) -> bool:
 
 
 def _explicitly_avoids_web_lookup(text: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(?:no\s+web|do\s+not\s+search|don'?t\s+search|without\s+looking\s+it\s+up|"
-            r"without\s+searching|answer\s+from\s+memory\s+only|from\s+memory)\b",
-            str(text or "").lower(),
-        )
-    )
+    return message_avoids_web_lookup(text)
 
 
 def _looks_like_explicit_plan_request(text: str) -> bool:
