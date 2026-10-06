@@ -331,7 +331,9 @@ def test_allows_files_in_the_agent_workspace():
     (PERSONAL_UPLOADS_DIR,
      "indexed into personal docs by routes/personal_routes.py, and listed as "
      "an absolute path by manage_rag"),
-])
+# The directories are per-process under xdist; IDs must not embed them, or
+# workers collect different test names and the run aborts at collection.
+], ids=["uploads", "mail_attachments", "personal_docs", "personal_uploads"])
 def test_allows_user_content_the_app_hands_to_the_model(directory, why):
     """Carving these out is not convenience. The app gives the model these
     paths and tells it to read them, so denying them breaks the feature."""
