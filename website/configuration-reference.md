@@ -199,7 +199,7 @@ Listed for completeness. Setting one of these on a real install is either a no-o
 |---|---|---|---|
 | `ODYSSEUS_CAPTURE_MODEL_REQUESTS` | `''` | `src/agent_loop.py:4151` | Truthy writes model-request snapshots for local debugging. The marker file `/tmp/odysseus_capture_model_requests` enables the same thing. |
 | `ODYSSEUS_EXPOSE_RAW_BROWSER_MCP` | `''` | `src/agent_loop.py:4356` | Truthy stops hiding the raw Playwright MCP tools from agent prompts when the private-browser tool is available. |
-| `ODYSSEUS_TOOL_CONTRACT_ROOT` | `str(Path(__file__).resolve().parents[1] / 'scripts')` | `src/clean_agent_preview.py:2324` (+1 more) | Directory holding the tool-contract scripts the clean-agent preview loads. The default resolves to the bundled scripts directory relative to the installed/source tree. |
+| `ODYSSEUS_TOOL_CONTRACT_ROOT` | `str(Path(__file__).resolve().parents[1] / 'scripts')` | `src/clean_agent_preview.py:2359` (+1 more) | Directory holding the tool-contract scripts the clean-agent preview loads. The default resolves to the bundled scripts directory relative to the installed/source tree. |
 
 ### Email
 
