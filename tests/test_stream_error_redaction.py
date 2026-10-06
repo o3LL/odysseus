@@ -222,3 +222,64 @@ def test_untrusted_validation_detail_cannot_masquerade_as_curated_guidance(detai
     assert "TAKEOVER_SECRET" not in public
     assert "/srv/private" not in public
     assert "PRIVATE_TOKEN" not in public
+
+
+# Validator-authored corrections are guidance the model needs to fix its call.
+# They pass through only as PreviewToolCallGuidance; the same text in a plain
+# ValueError stays generic, so arbitrary detail still cannot masquerade.
+
+def _validator_messages():
+    from src.clean_agent_preview import (
+        artifact_completion_python_code_error,
+        email_identifier_error,
+        normalized_native_function_argument_error,
+    )
+    return [
+        normalized_native_function_argument_error("pdf_extract", {"url": "Attention is all you need"}),
+        email_identifier_error("read_email", {"uid": "99999"}, user_text="read that email", history=()),
+        artifact_completion_python_code_error({"code": "/workspace/out.csv"}, ("/workspace/out.csv",)),
+    ]
+
+
+def test_validator_guidance_reaches_the_model():
+    from src.clean_agent_preview import PreviewToolCallGuidance, _public_preview_tool_error
+    for message in _validator_messages():
+        assert message
+        assert _public_preview_tool_error(PreviewToolCallGuidance(message)) == message
+        assert message not in _public_preview_tool_error(
+            PreviewToolCallGuidance(message), execution_attempted=True)
+        assert _public_preview_tool_error(ValueError(message)) != message
+
+
+def test_schema_guidance_comes_from_the_schema_not_the_exception(monkeypatch):
+    import src.clean_agent_preview as module
+    parameters = next(s for s in FUNCTION_TOOL_SCHEMAS
+                      if s["function"]["name"] == "web_search")["function"]["parameters"]
+
+    def fail(*args, **kwargs):
+        raise jsonschema.ValidationError(SENSITIVE, instance={"private": SENSITIVE})
+
+    monkeypatch.setattr(module.jsonschema, "validate", fail)
+    with pytest.raises(module.PreviewSchemaGuidance) as raised:
+        module._validate_preview_arguments({"query": 7}, parameters)
+    public = module._public_preview_tool_error(raised.value)
+    assert "Wrong type: query (expected string)" in public
+    assert "Accepted arguments: query" in public
+    assert "TAKEOVER_SECRET" not in public and "PRIVATE" not in public
+
+
+@pytest.mark.asyncio
+async def test_missing_required_argument_is_named_to_the_model(monkeypatch, caplog):
+    module = _preview_provider(monkeypatch, [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "function": {
+            "name": "manage_notes", "arguments": "{}",
+        }}]}}]},
+        {"choices": [{"delta": {"content": "Done."}}]},
+    ] * 8)
+    schema = next(s for s in FUNCTION_TOOL_SCHEMAS if s["function"]["name"] == "manage_notes")
+    required = schema["function"]["parameters"]["required"]
+    chunks = await _client_chunks(_preview_generator(module, [schema]), False)
+    tool_event = next(e for e in _events(chunks) if e.get("type") == "tool_output")
+    assert tool_event["error"] is True
+    assert tool_event["error_category"] == "invalid_tool_arguments"
+    assert "Missing required: " + ", ".join(required) in tool_event["output"]

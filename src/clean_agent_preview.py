@@ -96,10 +96,70 @@ _PUBLIC_PREVIEW_TOOL_ERRORS = {message: message for message in (
 )}
 
 
+class PreviewToolCallGuidance(ValueError):
+    """A correction this module's validators authored for the model.
+
+    Only raised with text built by the semantic/artifact validators or by
+    ``_schema_guidance``; arbitrary ValueError text never takes this path.
+    """
+
+
+class PreviewSchemaGuidance(PreviewToolCallGuidance):
+    """Schema mismatch described from the offered schema and the model's own arguments."""
+
+
+_JSON_TYPES = {
+    'string': (str,), 'integer': (int,), 'number': (int, float), 'boolean': (bool,),
+    'array': (list, tuple), 'object': (dict,), 'null': (type(None),),
+}
+
+
+def _json_type_matches(value, expected):
+    names = expected if isinstance(expected, list) else [expected]
+    known = [_JSON_TYPES[name] for name in names if name in _JSON_TYPES]
+    if not known:
+        return True
+    if isinstance(value, bool) and not any(bool in kinds for kinds in known):
+        return False
+    return any(isinstance(value, kinds) for kinds in known)
+
+
+def _schema_guidance(args, parameters):
+    """Describe a schema mismatch without reading the validation exception."""
+    parameters = parameters if isinstance(parameters, dict) else {}
+    properties = parameters.get('properties') if isinstance(parameters.get('properties'), dict) else {}
+    supplied = args if isinstance(args, dict) else {}
+    parts = ['Tool arguments do not match the required schema.']
+    missing = [name for name in parameters.get('required') or () if isinstance(name, str) and name not in supplied]
+    if missing:
+        parts.append('Missing required: ' + ', '.join(missing[:10]) + '.')
+    wrong = [
+        f"{name} (expected {'/'.join(spec['type']) if isinstance(spec.get('type'), list) else spec['type']})"
+        for name, spec in properties.items()
+        if name in supplied and isinstance(spec, dict) and 'type' in spec
+        and not _json_type_matches(supplied[name], spec['type'])
+    ]
+    if wrong:
+        parts.append('Wrong type: ' + ', '.join(wrong[:10]) + '.')
+    if properties:
+        parts.append('Accepted arguments: ' + ', '.join(list(properties)[:20]) + '.')
+    parts.append('Correct the call using the offered tool schema.')
+    return ' '.join(parts)
+
+
+def _validate_preview_arguments(args, parameters):
+    try:
+        jsonschema.validate(args, parameters)
+    except jsonschema.ValidationError as error:
+        raise PreviewSchemaGuidance(_schema_guidance(args, parameters)) from error
+
+
 def _public_preview_tool_error(exc, *, execution_attempted=False):
     """Keep useful domain guidance while withholding arbitrary diagnostics."""
     if execution_attempted:
         return 'The tool failed unexpectedly. Check the server log and retry.'
+    if type(exc) in (PreviewToolCallGuidance, PreviewSchemaGuidance):
+        return str(exc)
     if isinstance(exc, json.JSONDecodeError):
         return 'Tool arguments are not valid JSON. Correct the JSON object and retry.'
     if isinstance(exc, jsonschema.ValidationError):
@@ -6938,7 +6998,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                     'This exact invalid call was repeated after two validation failures; '
                                     'the tool is disabled for this turn.'
                                 )
-                            raise ValueError(semantic_error)
+                            raise PreviewToolCallGuidance(semantic_error)
                         if canonical(name) == 'bash':
                             command = str(args.get('command') or '')
                             sensitive_error = shell_sensitive_command_error(command)
@@ -7100,7 +7160,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             str(args.get('url') or '').strip() or args.get('urls')
                         ):
                             raise ValueError('web_fetch requires url or urls. query only filters a supplied page; it is not a search or writing request.')
-                        jsonschema.validate(args, schema['function']['parameters'])
+                        _validate_preview_arguments(args, schema['function']['parameters'])
                         if (
                             artifact_write_phase
                             and canonical(name) == 'python'
@@ -7111,7 +7171,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             )
                             if artifact_code_error:
                                 round_recovery_messages.append(artifact_code_error)
-                                raise ValueError(artifact_code_error)
+                                raise PreviewToolCallGuidance(artifact_code_error)
                         decision = evaluate_preview_call(
                             name, args, latest_user,
                             experiment_fixture_ids=experiment_fixture_ids,
@@ -7269,7 +7329,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                 successful_artifact_write = True
                     except (ValueError, jsonschema.ValidationError) as exc:
                         if not execution_attempted and not policy_denied and (
-                            isinstance(exc, (jsonschema.ValidationError, json.JSONDecodeError))
+                            isinstance(exc, (jsonschema.ValidationError, json.JSONDecodeError, PreviewSchemaGuidance))
                             or str(exc).startswith('web_fetch requires url or urls.')
                             or str(exc) in {'Tool arguments could not be converted for execution.',
                                             'Tool arguments must be a JSON object.'}
