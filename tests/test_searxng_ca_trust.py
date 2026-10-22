@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import hashlib
 from pathlib import Path
 import ssl
@@ -54,6 +55,19 @@ class SearxngTrustTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "refusing to empty"):
                 repair.filter_bundle(path)
             self.assertEqual(path.read_text(), original)
+
+    def test_derived_base_matches_every_compose_pin(self):
+        # The overlay corrects whatever image Compose selects; a pin bump that
+        # skips the derived Dockerfile would silently run the older base.
+        base = re.search(r"^FROM (\S+) AS base$", (ROOT / "docker/searxng/Dockerfile").read_text(), re.M)
+        self.assertIsNotNone(base)
+        for name in ("docker-compose.yml", "docker-compose.gpu-amd.yml", "docker-compose.gpu-nvidia.yml"):
+            with self.subTest(compose=name):
+                pins = re.findall(r"image:\s*(\S*searxng/searxng:\S+)", (ROOT / name).read_text())
+                self.assertEqual(pins, [base.group(1)])
+        version = base.group(1).split(":", 1)[1].split("-", 1)[0]
+        overlay = (ROOT / "docker/searxng/compose.yml").read_text()
+        self.assertIn(f"image: localhost/odysseus-searxng:{version}-ca-trust", overlay)
 
     def test_empty_and_malformed_input_fail_closed(self):
         for text in ("", "not a certificate", "-----BEGIN CERTIFICATE-----\nbroken\n-----END CERTIFICATE-----"):
