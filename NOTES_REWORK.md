@@ -46,20 +46,22 @@ The goal was an Apple Notes-style experience: one place to edit a note, everythi
 
 ## What Notes and the document editor could share
 
-From a first read of `static/js/document.js` and `routes/document/`. These are proposals to discuss, not decisions.
+Baseline for the document side: the decomposition in #7292 (`frontend/src/features/documents/`, published to `static/js/document/`). It uses the same `application` / `domain` / `ui` layout as `frontend/src/features/notes/`, which makes sharing modules much simpler than it was with the old `document.js`. Both branches start from `dev @ 0096533c`, and the only files they both touch are `frontend/modules.json` and `static/sw.js`. A local merge of the two only conflicts in `static/sw.js` (cache name and precache list).
 
-| Area | Notes (this branch) | Document editor (`dev`) | Idea |
+These are proposals to discuss, not decisions.
+
+| Area | Notes (this branch) | Documents (#7292) | Idea |
 |---|---|---|---|
-| Markdown ⇄ editable DOM | Block-level serializer that writes back only edited blocks and keeps untouched source byte for byte (`markdownSerializer.js`, `sourceFidelity.js`) | Its own markdown handling inside `document.js` | One shared round-trip module, with the same fidelity tests for both |
-| Rich blocks | Islands for math, mermaid, code, raw HTML; table and link popovers | KaTeX, tables, code runner, rich-text toolbar | Shared island and popover components, both rendered through `static/js/markdown.js` |
-| Saving and conflicts | Base-version check, 409, "changed elsewhere" banner, local draft, retry on reconnect (`application/noteSession.js`, `core/note_writes.py`) | `PUT /api/document/{id}` with no base-version check I could find; local drafts in `localStorage` | One save session with conflict detection. Today two tabs, or a tool edit and a user edit, can overwrite each other |
-| Version history | Versions per author, diff against now, restore, summary text (`core/note_versions.py`, `ui/historyPanel.js`, `domain/historyText.js`) | `document_versions` (immutable snapshots, `source` ai/user), list / get / restore routes | One versions service and one history panel. The doc model already tags the source, and Notes adds author-aware merging and the diff view |
-| Tool edits with Undo | Edits scoped to one target, Undo restoring exact bytes, approval on shared content (`core/note_agent_scope.py`) | Document tools edit docs (`src/agent_tools/document_tools.py`) | Same scope + Undo + approval pattern for documents |
-| Images | Upload, paste, resize, sketch, external-image setting, media access checks | Uploads and import (PDF/DOCX) | Shared image insertion and external-image policy |
-| Sharing | View/Edit grants, fail-closed checks | Owner only | If documents need sharing, reuse the same grant model and checks |
+| Saving and conflicts | Base-version check, 409, "changed elsewhere" banner (Keep mine / Reload), local draft, retry on reconnect (`application/noteSession.js`, `core/note_writes.py`) | `application/persistence.js` serialises saves and keeps detached drafts until a save succeeds, but `PUT /api/document/{id}` still has no base-version check (#7292 doesn't touch the routes) | One save session with conflict detection on both sides. Today two tabs, or a tool edit and a user edit, can still overwrite a document |
+| Version history and diff | Versions per author, diff against now, one-line summaries, restore (`core/note_versions.py`, `ui/historyPanel.js`, `domain/historyText.js`) | `ui/history/versionHistory.js` + `ui/diffViewer.js` over `document_versions` (immutable snapshots tagged by source, list / get / restore) | One versions service and one history panel. Documents already tag the source, and Notes adds author-aware merging and the "against now" view. One diff component for both |
+| Tool edits with Undo | Edits scoped to one target, Undo restoring exact bytes, approval on shared content (`core/note_agent_scope.py`) | `ui/aiUpdates/documentUpdate.js`, `ui/aiUpdates/liveStream.js`, plus `src/agent_tools/document_tools.py` on the server | Same scope + Undo + approval pattern for documents |
+| Rich editing | WYSIWYG over **markdown**: block-level serializer that writes back only edited blocks (`domain/markdownSerializer.js`, `domain/sourceFidelity.js`, `ui/richBody.js`), islands for math / mermaid / code / raw HTML | Rich text is stored as sanitized **HTML** (`richtext` documents, `ui/richEditor/*`, `domain/richTextRules.js`). Markdown documents go through `ui/editor/sourceEditor.js` and preview modes | Not the same storage, so no shared serializer for now. The interaction pieces can be shared: toolbar and format menus, links, tables (`ui/richTables.js`), slash menu, selection toolbar. The Notes serializer could also give markdown documents an in-place editing mode later |
+| Images | Paste / drop / upload, S/M/L resize, sketch, external-image setting, media access checks | `ui/richEditor/imageOps.js`, `imageMenus.js`, `ui/editor/markdownImages.js` | One image-insertion and resize module, and one external-image policy |
+| Drafts | Local draft with a restore banner on reopen | Detached drafts in `application/persistence.js`, email `ui/email/localDraft.js` | One draft store with the same restore rules |
+| Sharing | View / Edit grants, fail-closed checks (`core/notes_sharing.py`) | Owner only | If documents need sharing, reuse the same grant model and checks |
 | Limits and caching | Size limits as constants, bounded view cache | — | Same constants and guards |
 
-The part I'd tackle first is **save + conflicts + versions**: it's the most valuable to both, the easiest to cut cleanly, and it doesn't touch rendering. The markdown round-trip comes next, but it's the riskiest to share because both editors depend on its exact output.
+Where I'd start: **saving + conflicts + versions/diff**. It brings the most to both sides, cuts cleanly once #7292 is in, and doesn't touch rendering. Next would be the editing pieces: toolbar, links, tables, images. The serializer stays Notes-only until we agree on the storage format.
 
 ## Running it
 
