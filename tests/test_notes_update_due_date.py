@@ -49,6 +49,9 @@ def _install_fakes(monkeypatch, note, parse=None):
         def commit(self):
             pass
 
+        def refresh(self, *a, **k):
+            pass
+
         def close(self):
             pass
 
@@ -62,6 +65,14 @@ def _install_fakes(monkeypatch, note, parse=None):
     def _default_parse(s):
         calls["parsed"].append(s)
         return "PARSED::" + s
+
+    # The note is a plain namespace, not a mapped row: write it straight
+    # through instead of the row-version compare.
+    from src.tools import notes as notes_tool
+    monkeypatch.setattr(notes_tool, "stored_stamp", lambda db, note_id: None)
+    monkeypatch.setattr(notes_tool, "commit_if_unchanged", lambda db, note, stamp: db.commit())
+    # Version history (core.note_versions) needs real rows; not what these tests are about.
+    monkeypatch.setattr(notes_tool, "record_version", lambda *a, **k: None)
 
     fake_cal = types.ModuleType("routes.calendar_routes")
     fake_cal.parse_due_for_user = parse or _default_parse

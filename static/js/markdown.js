@@ -147,14 +147,40 @@ function safeLinkUrl(rawUrl) {
   return '';
 }
 
-function linkHtml(text, url) {
-  const safeUrl = safeLinkUrl(url);
-  const safeText = escapeHtml(text);
-  if (!safeUrl) return safeText;
-  if (safeUrl.startsWith('#')) {
-    return `<a href="${safeUrl}" class="chat-link">${safeText}</a>`;
+// A note keeps what its author wrote in a link: a "title", a mailto: or tel:
+// target, a path on this site. Chat and documents keep http(s) and anchors
+// only, as before.
+const NOTE_LINK_TITLE_RE = /^(\S+)\s+"([^"]*)"\s*$/;
+function noteLinkTarget(rawUrl) {
+  let url = String(rawUrl || '').trim();
+  let title = '';
+  const titled = NOTE_LINK_TITLE_RE.exec(url);
+  if (titled) [, url, title] = titled;
+  if (/^(?:mailto|tel):[^\s]+$/i.test(url)) return { url, title };
+  if (/^\/(?!\/)/.test(url)) {
+    try {
+      if (new URL(url, window.location.origin).origin === window.location.origin) return { url, title };
+    } catch (_) {
+      return { url: '', title };
+    }
   }
-  return `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${safeText}</a>`;
+  return { url: safeLinkUrl(url), title };
+}
+
+// `stamp` (the note editor only, see mdToHtml's `sourceMap`) is extra
+// attributes carrying the link's markdown as written, so an edit writes back
+// every scheme and title. A target the renderer refuses still becomes an <a>,
+// with no href: inert, but the editor can show and edit it.
+function linkHtml(text, url, notes = false, stamp = '') {
+  const target = notes ? noteLinkTarget(url) : { url: safeLinkUrl(url), title: '' };
+  const safeUrl = target.url;
+  const safeText = escapeHtml(text);
+  if (!safeUrl) return stamp ? `<a${stamp}>${safeText}</a>` : safeText;
+  const title = target.title ? ` title="${escapeHtml(target.title)}"` : '';
+  if (safeUrl.startsWith('#')) {
+    return `<a href="${safeUrl}" class="chat-link"${title}${stamp}>${safeText}</a>`;
+  }
+  return `<a href="${escapeHtml(safeUrl)}"${title} target="_blank" rel="noopener noreferrer"${stamp}>${safeText}</a>`;
 }
 
 function linkifyPlainEmailUidLines(src) {
@@ -925,20 +951,264 @@ function replaceRawSvgBlocks(source, makePlaceholder) {
   return output;
 }
 
+// Notes render task lines as interactive checkboxes (`opts.tasks ===
+// 'interactive'`). Which lines are tasks, and their 0-based index, must match
+// core/notes_markdown.py and features/notes/domain/markdownTasks.js exactly:
+// the index is what the toggle endpoint flips. So before any other pass, the
+// note source is walked with those fence rules, every fenced block becomes a
+// code placeholder, and every task line is stamped with its index. Pinned by
+// tests/fixtures/notes_task_vectors.json.
+const NOTE_TASK_RE = /^([ \t]*)([-*+])[ \t]+\[([ xX])\][ \t]?([^\n]*)$/;
+// `[^\n]*`, not `.*`: a lone CR or U+2028 on the opener line must not stop it
+// being a fence, or the boxes after it would be numbered differently here.
+const NOTE_FENCE_RE = /^[ \t]*(`{3,}|~{3,})([^\n]*)$/;
+const NOTE_TASK_TOKEN_RE = /^___MD_TASK_(\d+)_(\d+)___ ?/;
+// MAX_INDENT in features/notes/domain/markdownTasks.js. This legacy module is
+// loaded on its own by tests and other pages, so it keeps a copy; the shared
+// task vectors and notesMarkdownSerializer.test.mjs pin the two together.
+const NOTE_MAX_TASK_INDENT = 3;
+
+function _noteTaskIndent(ws) {
+  let width = 0;
+  for (const ch of ws) width += ch === '\t' ? 2 : 1;
+  return Math.min(NOTE_MAX_TASK_INDENT, Math.floor(width / 2));
+}
+
+function prepareNoteTasks(src, renderFence) {
+  const out = [];
+  let fence = null;
+  let index = 0;
+  for (const raw of String(src).replace(/\r\n/g, '\n').split('\n')) {
+    const marker = NOTE_FENCE_RE.exec(raw);
+    if (fence) {
+      if (marker && marker[1][0] === fence.char && marker[1].length >= fence.len) {
+        out.push(renderFence(fence.lang, fence.body.join('\n'), { open: fence.open, close: raw, body: fence.body }));
+        fence = null;
+      } else {
+        fence.body.push(raw);
+      }
+      continue;
+    }
+    if (marker) {
+      fence = { char: marker[1][0], len: marker[1].length, lang: (/^\s*(\w+)/.exec(marker[2]) || [])[1], body: [], open: raw };
+      continue;
+    }
+    const task = NOTE_TASK_RE.exec(raw);
+    if (task) {
+      const text = task[4].trim();
+      out.push(`- [${task[3]}] ___MD_TASK_${index++}_${_noteTaskIndent(task[1])}___${text ? ' ' + text : ''}`);
+      continue;
+    }
+    out.push(raw);
+  }
+  if (fence) out.push(renderFence(fence.lang, fence.body.join('\n'), { open: fence.open, close: null, body: fence.body }));
+  return out.join('\n');
+}
+
+// Note images (`opts.images === 'notes'`) load from this origin only: an
+// upload, a raster data: URL or a same-origin blob:. Anything else renders as
+// a plain link, so a note an agent wrote cannot make the page fetch an
+// attacker URL just by being displayed.
+function noteImageSrc(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  if (/^data:image\/(?:png|jpe?g|gif|webp);base64,[a-z0-9+/=]+$/i.test(url)) return url;
+  try {
+    if (/^blob:/i.test(url)) return new URL(url.slice(5)).origin === window.location.origin ? url : '';
+    const parsed = new URL(url, window.location.origin);
+    if (parsed.origin === window.location.origin
+      && (parsed.pathname.startsWith('/api/upload/') || NOTE_MEDIA_PATH_RE.test(parsed.pathname))) {
+      return parsed.pathname + parsed.search;
+    }
+  } catch (_) {
+    return '';
+  }
+  return '';
+}
+
+// With "Show external images in notes" on (`opts.externalImages`, the
+// viewer's own setting), a markdown image from another site renders as an
+// image too. Only https: is accepted, which is also all the page CSP allows
+// (`img-src ... https:`); anything else keeps the link.
+function noteExternalImageSrc(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  try {
+    return new URL(url).protocol === 'https:' ? url : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+// `/api/upload/<id>` is readable by the uploader only. A shared note
+// (`opts.mediaNote` = its id) loads each upload through the note instead,
+// `/api/notes/<note>/media/<id>`, which anyone who can read the note may
+// fetch. Only the rendered src changes; the stored markdown keeps the upload
+// path, and the note serializer maps it back.
+const NOTE_MEDIA_PATH_RE = /^\/api\/notes\/[^/?#]+\/media\/[0-9a-f]{32}(?:\.[a-z0-9]+)?$/i;
+function noteMediaSrc(src, mediaNote) {
+  if (!mediaNote) return src;
+  const upload = /^\/api\/upload\/([0-9a-f]{32}(?:\.[a-z0-9]+)?)$/i.exec(src);
+  return upload ? `/api/notes/${encodeURIComponent(mediaNote)}/media/${upload[1]}` : src;
+}
+
+// A note image's title `w=N` is its width in percent of the note, clamped to
+// 5..100; full width needs no attribute. Any other title stays a title. The
+// bounds are IMAGE_WIDTH_MIN/MAX in features/notes/domain/markdownSerializer.js,
+// copied here for the reason given at NOTE_MAX_TASK_INDENT.
+const NOTE_IMAGE_WIDTH_MIN = 5;
+const NOTE_IMAGE_WIDTH_MAX = 100;
+function noteImageSize(title) {
+  const size = /^w=(\d{1,3})$/.exec(String(title || '').trim());
+  if (!size) return title ? ` title="${escapeHtml(title)}"` : '';
+  const width = Math.max(NOTE_IMAGE_WIDTH_MIN, Math.min(NOTE_IMAGE_WIDTH_MAX, Number(size[1])));
+  return width === NOTE_IMAGE_WIDTH_MAX ? '' : ` data-w="${width}" style="width:${width}%"`;
+}
+
+// Link schemes a note may carry: the web, mail and phone. Anything else with
+// a scheme (javascript:, data:, a custom app scheme) is refused; a scheme-less
+// value is a path or an anchor on this site.
+const NOTE_LINK_SCHEMES = new Set(['http', 'https', 'mailto', 'tel']);
+const NOTE_LINK_ATTRS = new Set(['href', 'xlink:href', 'action', 'formaction']);
+
+/** True when a note may keep `value` as a link target (see NOTE_LINK_SCHEMES). */
+export function noteLinkAllowed(value) {
+  const scheme = /^([a-z][a-z0-9+.-]*):/.exec(_compactUrlSchemeValue(value));
+  return !scheme || NOTE_LINK_SCHEMES.has(scheme[1]);
+}
+
+// CSS that can make the browser fetch: url() and the image functions that
+// take a URL string (image-set, cross-fade, image, element), plus src() and
+// paint(). Read after CSS escapes and comments are undone, so `u\72l(` or
+// `ur/**/l(` is still url(.
+const NOTE_CSS_FETCH_RE = /(?:url|image-set|image|cross-fade|element|src|paint)\(|@import|expression\(/;
+
+function _cssFetches(value) {
+  const plain = String(value || '')
+    .replace(/\/\*[\s\S]*?(?:\*\/|$)/g, '')
+    .replace(/\\([0-9a-f]{1,6})[ \t\n\r\f]?/gi, (_m, hex) => {
+      const code = parseInt(hex, 16);
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
+    })
+    .replace(/\\([^\n0-9a-f])/gi, '$1')
+    .replace(/[\s\u0000-\u001f]+/g, '')
+    .toLowerCase();
+  return NOTE_CSS_FETCH_RE.test(plain);
+}
+
+// The last pass over a note's HTML, on an inert <template> before the markup
+// reaches the page. (Raw <iframe> never gets this far, so the renderer's own
+// sandboxed SVG preview keeps its srcdoc.) It runs after the notes dialect has put its escaped
+// characters back, so it sees every attribute in its final form, which the
+// allowed-HTML sanitizer (run earlier, on raw HTML blocks) does not: there a
+// `javascript\:` is still a placeholder.
+//  - every inline handler goes, and every link target is re-checked;
+//  - a task's checkbox is named after its text, for screen readers;
+//  - with `images` (notes images), nothing may fetch from another origin:
+//    srcset, poster and friends go, a `src` must pass noteImageSrc, and a
+//    style that names a URL in any form goes. The one exception is an
+//    external image the renderer itself built from markdown, with the
+//    setting on: it carries this render's `externalNonce`, which raw HTML in
+//    the note cannot know, and it never sends a referrer or a credential.
+function scrubNoteHtml(html, { images, externalNonce = '' }) {
+  if (typeof document === 'undefined') return html;
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  for (const el of Array.from(tpl.content.querySelectorAll('*'))) {
+    if (` ${el.getAttribute('class') || ''} `.includes(' md-task-text ') && el.previousSibling?.getAttribute?.('role') === 'checkbox') {
+      el.previousSibling.setAttribute('aria-label', String(el.textContent || '').replace(/\s+/g, ' ').trim());
+    }
+    const external = !!externalNonce && el.tagName === 'IMG' && el.getAttribute(NOTE_EXTERNAL_IMAGE_ATTR) === externalNonce
+      && !!noteExternalImageSrc(el.getAttribute('src'));
+    el.removeAttribute(NOTE_EXTERNAL_IMAGE_ATTR);
+    if (external) {
+      el.setAttribute('referrerpolicy', 'no-referrer');
+      el.removeAttribute('crossorigin');
+      el.setAttribute('loading', 'lazy');
+    }
+    for (const attr of Array.from(el.attributes || [])) {
+      const name = attr.name.toLowerCase();
+      const drop = name.startsWith('on')
+        || (NOTE_LINK_ATTRS.has(name) && !noteLinkAllowed(attr.value))
+        || (name === 'src' && !external && (images ? !noteImageSrc(attr.value) : _isDangerousUrl(attr.value)))
+        || (images && (name === 'srcset' || name === 'poster' || name === 'background' || name === 'ping' || name === 'xlink:href'
+          || (name === 'style' && _cssFetches(attr.value))));
+      if (drop) el.removeAttribute(attr.name);
+    }
+  }
+  return tpl.innerHTML;
+}
+
+// The mark on an external image the renderer built; see scrubNoteHtml.
+const NOTE_EXTERNAL_IMAGE_ATTR = 'data-ody-external';
+function _renderNonce() {
+  const bytes = new Uint8Array(12);
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// The notes dialect (`opts.dialect === 'notes'`) is what the note editor
+// writes back: a backslash escapes a markdown character (so `2 \* 3 \* 4`
+// stays text), indented `- ` bullets nest, and an ordered list keeps the
+// number it starts at. Code spans and `\[ \]` / `\( \)` math keep their
+// backslashes. Chat and documents never pass it, so their output is unchanged.
+const NOTE_ESCAPE_RE = /((?<!`)(`+)(?!`)[\s\S]*?(?<!`)\2(?!`))|(\\\[[\s\S]*?\\\]|\\\([^\n]*?\\\))|\\([\\`*~#\-+.>|$<_!\[\]:])/g;
+// A code span in a note is any run of backticks closed by a run of the same
+// length, so code can hold a backtick (CommonMark). Chat keeps single ticks.
+const NOTE_CODE_SPAN_RE = /(?<!`)(`+)(?!`)([\s\S]*?)(?<!`)\1(?!`)/g;
+// The formatting a note writes as HTML: underline, superscript, subscript,
+// highlight. Only a pair opened and closed on one line is formatting.
+const NOTE_HTML_MARK_RE = /<(u|sup|sub|mark)>((?:(?!<\/?\1>)[^\n])*?)<\/\1>/gi;
+const NOTE_HTML_MARK_TOKEN_RE = /___MD_TAG_(\/?)(u|sup|sub|mark)___/g;
+// The note editor's islands: what has no rich form (math, a diagram, a
+// <details>, an SVG) shows rendered and is edited as its own source.
+const ISLAND_CLASS = 'md-island';
+
+// `opts.sourceMap` (the note editor, with the notes dialect) stamps what an
+// edit cannot read back from the rendering onto the elements: a link's target
+// as written, a fence's opener and closer, a table's alignment, and the source
+// of each island. Cards and chat never pass it.
 export function mdToHtml(src, opts) {
+  const interactiveTasks = !!opts && opts.tasks === 'interactive';
+  const notesImages = !!opts && opts.images === 'notes';
+  const notesDialect = !!opts && opts.dialect === 'notes';
+  const sourceMap = notesDialect && !!opts.sourceMap;
+  // What each placeholder stood for in the source, so a stamp is the markdown
+  // as written and never carries a placeholder (a restore pass would fill the
+  // first occurrence of one, in an attribute, instead of its own).
+  const rawInlineCode = [];
+  const rawAllowedHtml = [];
+  const rawSource = (text, afterEscape = false) => {
+    let out = String(text);
+    for (let i = 0; i < 4 && /___(?:MD_ESC|INLINE_CODE|ALLOWED_HTML|MD_TAG)_/.test(out); i++) {
+      out = out
+        .replace(/___INLINE_CODE_(\d+)___/g, (_m, n) => rawInlineCode[Number(n)] ?? '')
+        .replace(/___ALLOWED_HTML_(\d+)___/g, (_m, n) => rawAllowedHtml[Number(n)] ?? '')
+        .replace(/___MD_ESC_(\d+)___/g, (_m, n) => `\\${escapedChars[Number(n)]}`)
+        .replace(NOTE_HTML_MARK_TOKEN_RE, (_m, close, tag) => `<${close}${tag}>`);
+    }
+    if (afterEscape) out = out.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    return out;
+  };
+  const island = (raw, inner, block = false) => {
+    const tag = block ? 'div' : 'span';
+    return `<${tag} class="${ISLAND_CLASS}" contenteditable="false" data-md-src="${escapeHtml(raw)}">${inner}</${tag}>`;
+  };
+  const mediaNote = notesImages && opts.mediaNote ? String(opts.mediaNote) : '';
+  // External images render only for a viewer who turned them on.
+  const externalNonce = notesImages && opts.externalImages ? _renderNonce() : '';
+  const escapedChars = [];
   const allowedHtmlBlocks = [];
   const codeBlocks = [];
   const inlineCodeBlocks = [];
   const mermaidBlocks = [];
   const svgBlocks = [];
-  let s = extractMoreListPayloads(flattenLegacyNoteMoreDetails(src ?? ''));
-
   // Extract fenced code blocks before any markdown/HTML preservation passes.
   // Otherwise placeholders from the allowed-HTML sanitizer (e.g.
   // ___ALLOWED_HTML_0___) can leak into quoted HTML/JS samples, because the
   // placeholder gets captured as literal code content and never restored inside
   // the final <pre><code> block.
-  s = s.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
+  const fencedBlockPlaceholder = (_, lang, code, fence = null) => {
+    const fenceSource = sourceMap && fence ? [fence.open, ...fence.body, ...(fence.close == null ? [] : [fence.close])].join('\n') : '';
     const cleaned = code
       .replace(/\r\n/g, '\n')
       .replace(/[ \t]+$/gm, '')
@@ -951,7 +1221,7 @@ export function mdToHtml(src, opts) {
     // malformed SVG remains confined to the frame instead of entering chat DOM.
     if (lang && lang.toLowerCase() === 'svg') {
       const placeholder = `___SVG_BLOCK_${svgBlocks.length}___`;
-      svgBlocks.push(renderSvgSandbox(cleaned));
+      svgBlocks.push(fenceSource ? island(fenceSource, renderSvgSandbox(cleaned), true) : renderSvgSandbox(cleaned));
       return placeholder;
     }
 
@@ -960,7 +1230,8 @@ export function mdToHtml(src, opts) {
       const mermaidId = 'mermaid-' + Date.now() + '-' + mermaidBlocks.length;
       const raw = cleaned.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
       const placeholder = `___MERMAID_BLOCK_${mermaidBlocks.length}___`;
-      mermaidBlocks.push(`<div class="mermaid-container"><pre class="mermaid" id="${mermaidId}">${escapeHtml(raw)}</pre></div>`);
+      const diagram = `<div class="mermaid-container"><pre class="mermaid" id="${mermaidId}">${escapeHtml(raw)}</pre></div>`;
+      mermaidBlocks.push(fenceSource ? island(fenceSource, diagram, true) : diagram);
       return placeholder;
     }
 
@@ -973,10 +1244,26 @@ export function mdToHtml(src, opts) {
       ? `<button type="button" class="run-code" data-code="${escapeHtml(escaped)}" data-lang="${lang}" title="Run code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg></button>`
       : '';
     const editBtn = `<button type="button" class="edit-code" title="Edit"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>`;
-    codeBlocks.push(`<pre><code${langClass} data-lang="${lang || ''}">${escapeHtml(escaped)}</code>${runBtn}${editBtn}<button type="button" class="copy-code" data-code="${escapeHtml(escaped)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></pre>`);
+    const fenceStamp = sourceMap && fence
+      ? ` data-md-open="${escapeHtml(fence.open)}"${fence.close == null ? '' : ` data-md-close="${escapeHtml(fence.close)}"`}`
+      : '';
+    codeBlocks.push(`<pre${fenceStamp}><code${langClass} data-lang="${lang || ''}">${escapeHtml(escaped)}</code>${runBtn}${editBtn}<button type="button" class="copy-code" data-code="${escapeHtml(escaped)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></pre>`);
 
     return placeholder;
-  });
+  };
+  // Notes number their task lines on the raw source, before anything else.
+  if (interactiveTasks) src = prepareNoteTasks(src ?? '', (lang, code, fence) => fencedBlockPlaceholder(null, lang, code, fence));
+  let s = extractMoreListPayloads(flattenLegacyNoteMoreDetails(src ?? ''));
+  // Only (lang, code): replace() would pass the match offset as `fence`.
+  s = s.replace(/```(\w+)?\n([\s\S]*?)```/g, (m, lang, code) => fencedBlockPlaceholder(m, lang, code));
+
+  if (notesDialect) {
+    s = s.replace(NOTE_ESCAPE_RE, (match, code, _run, math, ch) => {
+      if (code || math) return match;
+      escapedChars.push(ch);
+      return `___MD_ESC_${escapedChars.length - 1}___`;
+    });
+  }
 
   // Extract inline code spans before the link/autolink/HTML passes, mirroring
   // the fenced-block handling above. A URL inside `inline code` (e.g.
@@ -984,19 +1271,39 @@ export function mdToHtml(src, opts) {
   // autolink matches it, wraps it in an <a> tag, and swaps that for an
   // ___ALLOWED_HTML_ placeholder — corrupting the command. The old inline-code
   // pass ran after those passes, too late to protect it.
-  s = s.replace(/`([^`]+?)`/g, (match, code) => {
+  const inlineCode = (match, code) => {
     if (code.startsWith('___CODE_BLOCK_') || code.startsWith('___MERMAID_BLOCK_') || code.startsWith('___SVG_BLOCK_')) return match;
     const placeholder = `___INLINE_CODE_${inlineCodeBlocks.length}___`;
     inlineCodeBlocks.push(`<code>${escapeHtml(code)}</code>`);
+    rawInlineCode.push(match);
     return placeholder;
-  });
+  };
+  if (notesDialect) {
+    s = s.replace(NOTE_CODE_SPAN_RE, (match, _run, code) => {
+      if (!code) return match;
+      // One space each side pads a span that starts or ends with a backtick.
+      // A line break inside a span is a space (CommonMark).
+      const flat = code.replace(/\r?\n/g, ' ');
+      const inner = /^ [\s\S]*[^ ][\s\S]* $/.test(flat) ? flat.slice(1, -1) : flat;
+      return inlineCode(match, inner);
+    });
+    // Underline, superscript, subscript and highlight survive the escape
+    // pass below as tokens, and become their tags at the end.
+    for (let i = 0; i < 4; i++) {
+      const next = s.replace(NOTE_HTML_MARK_RE, (_m, tag, inner) => `___MD_TAG_${tag.toLowerCase()}___${inner}___MD_TAG_/${tag.toLowerCase()}___`);
+      if (next === s) break;
+      s = next;
+    }
+  } else {
+    s = s.replace(/`([^`]+?)`/g, inlineCode);
+  }
 
   // Some models occasionally omit the requested ```svg fence. Treat a
   // complete raw SVG element as the same visual artifact, while fenced and
   // inline-code examples remain protected by the extraction passes above.
   s = replaceRawSvgBlocks(s, rawSvg => {
     const placeholder = `___SVG_BLOCK_${svgBlocks.length}___`;
-    svgBlocks.push(renderSvgSandbox(rawSvg));
+    svgBlocks.push(sourceMap ? island(rawSource(rawSvg), renderSvgSandbox(rawSvg), true) : renderSvgSandbox(rawSvg));
     return placeholder;
   });
 
@@ -1049,14 +1356,48 @@ export function mdToHtml(src, opts) {
   // Convert markdown images before links so ![alt](url) does not become
   // literal "!" plus a normal link.
   s = s.replace(/!\[([^\]\n]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (match, alt, url, title) => {
-    return imageHtml(alt, url, title);
+    if (!notesImages) return imageHtml(alt, url, title);
+    const imgSrc = noteMediaSrc(noteImageSrc(url), mediaNote);
+    const externalSrc = !imgSrc && externalNonce ? noteExternalImageSrc(url) : '';
+    if (externalSrc) {
+      // Stamped like the link it would otherwise be, so the editor writes
+      // back the markdown as written whatever the rendering shows.
+      const stamps = sourceMap
+        ? ` data-md-image="" data-md-alt="${escapeHtml(rawSource(alt))}" data-md-dest="${escapeHtml(rawSource(match.slice(match.indexOf('](') + 2, -1)))}"`
+        : '';
+      const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
+      allowedHtmlBlocks.push(`<img class="md-note-image md-note-external" src="${escapeHtml(externalSrc)}" alt="${escapeHtml(alt || '')}"${noteImageSize(title)}${stamps} ${NOTE_EXTERNAL_IMAGE_ATTR}="${externalNonce}" referrerpolicy="no-referrer" loading="lazy" decoding="async">`);
+      rawAllowedHtml.push(rawSource(match));
+      return placeholder;
+    }
+    if (!imgSrc) {
+      if (!sourceMap) return linkHtml(alt || url, url);
+      // An image from elsewhere is never fetched: it shows as a link, which
+      // the editor writes back as the image it is.
+      const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
+      const dest = rawSource(match.slice(match.indexOf('](') + 2, -1));
+      allowedHtmlBlocks.push(sanitizeAllowedHtml(linkHtml(alt || url, url, false,
+        ` data-md-image="" data-md-alt="${escapeHtml(rawSource(alt))}" data-md-dest="${escapeHtml(dest)}"`)));
+      rawAllowedHtml.push(rawSource(match));
+      return placeholder;
+    }
+    // Built from escaped parts here, so it skips the allowed-HTML sanitizer,
+    // which would strip the data: URLs this policy accepts.
+    const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
+    allowedHtmlBlocks.push(`<img class="md-note-image" src="${escapeHtml(imgSrc)}" alt="${escapeHtml(alt || '')}"${noteImageSize(title)} loading="lazy" decoding="async">`);
+    rawAllowedHtml.push(rawSource(match));
+    return placeholder;
   });
 
   // Convert markdown links [text](url) to clickable links
   // Internal #hash links navigate in-page; external links open in new tab
   s = s.replace(/\[((?:\\.|[^\]\\\n])+)\]\(([^)]+)\)/g, (match, text, url) => {
     const label = text.replace(/\\([\[\]])/g, '$1');
-    return linkHtml(label, url);
+    if (!sourceMap) return linkHtml(label, url, notesDialect);
+    const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
+    allowedHtmlBlocks.push(sanitizeAllowedHtml(linkHtml(label, url, true, ` data-md-dest="${escapeHtml(rawSource(url))}"`)));
+    rawAllowedHtml.push(rawSource(match));
+    return placeholder;
   });
 
   // Autolink bare URLs (http/https). Skips URLs already inside <a> tags
@@ -1086,7 +1427,8 @@ export function mdToHtml(src, opts) {
   // Extract <details>...</details> blocks and replace with placeholders.
   s = s.replace(/<details>([\s\S]*?)<\/details>/gi, (match) => {
     const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
-    allowedHtmlBlocks.push(sanitizeAllowedHtml(match));
+    allowedHtmlBlocks.push(sourceMap ? island(rawSource(match), sanitizeAllowedHtml(match), true) : sanitizeAllowedHtml(match));
+    rawAllowedHtml.push(rawSource(match));
     return placeholder;
   });
 
@@ -1095,6 +1437,7 @@ export function mdToHtml(src, opts) {
   s = s.replace(/<(?:a\s+[^>]*>.*?<\/a|img\s+[^>]*?)>/gi, (match) => {
     const placeholder = `___ALLOWED_HTML_${allowedHtmlBlocks.length}___`;
     allowedHtmlBlocks.push(sanitizeAllowedHtml(match));
+    rawAllowedHtml.push(rawSource(match.replace(/<[^>]*>/g, '')));
     return placeholder;
   });
 
@@ -1109,38 +1452,40 @@ export function mdToHtml(src, opts) {
 
   // Typeset straight away when KaTeX is already in, otherwise bank the source in
   // an inert placeholder for renderMath() to swap once the library lands.
-  const pushMath = (math, displayMode) => {
+  const pushMath = (math, displayMode, match) => {
     const raw = decodeMathSource(math).trim();
     const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
+    let html;
     if (window.katex) {
-      mathBlocks.push(katex.renderToString(raw, { displayMode, throwOnError: false }));
+      html = katex.renderToString(raw, { displayMode, throwOnError: false });
     } else {
       sawPendingMath = true;
-      mathBlocks.push(`<span class="${MATH_PENDING_CLASS}" data-display="${displayMode}">${escapeHtml(raw)}</span>`);
+      html = `<span class="${MATH_PENDING_CLASS}" data-display="${displayMode}">${escapeHtml(raw)}</span>`;
     }
+    mathBlocks.push(sourceMap ? island(rawSource(match, true), html) : html);
     return placeholder;
   };
 
   // Display math: \[ ... \]  — GPT-style delimiter (gpt-5.x, Claude, etc.).
   // Handle before $$/$ so all common delimiters render.
   s = s.replace(/\\\[([\s\S]*?)\\\]/g, (match, math) => {
-    try { return pushMath(math, true); } catch (e) { return match; }
+    try { return pushMath(math, true, match); } catch (e) { return match; }
   });
   // Inline math: \( ... \)  — GPT-style inline delimiter. Single-line only
   // ([^\n]) so a stray escaped paren in prose can't swallow across lines.
   s = s.replace(/\\\(([^\n]*?)\\\)/g, (match, math) => {
-    try { return pushMath(math, false); } catch (e) { return match; }
+    try { return pushMath(math, false, match); } catch (e) { return match; }
   });
   // Display math: $$...$$
   s = s.replace(/\$\$([\s\S]*?)\$\$/g, (match, math) => {
-    try { return pushMath(math, true); } catch (e) { return match; }
+    try { return pushMath(math, true, match); } catch (e) { return match; }
   });
   // Inline math: $...$ — single line only, and Pandoc-style delimiter rules so
   // currency doesn't render as math ("$5 to $10"): the opening $ must be
   // immediately followed by a non-space, the closing $ must be immediately
   // preceded by a non-space and not followed by a digit.
   s = s.replace(/(?<![\$\d])\$(?!\$)(?=\S)([^\$\n]+?)(?<=\S)\$(?!\$|\d)/g, (match, math) => {
-    try { return pushMath(math, false); } catch (e) { return match; }
+    try { return pushMath(math, false, match); } catch (e) { return match; }
   });
 
   if (sawPendingMath) _scheduleMathFlush();
@@ -1153,6 +1498,14 @@ export function mdToHtml(src, opts) {
     if (rows.length < 2) return table;
 
     let html = '<table style="border-collapse: collapse; width: 100%; margin: 10px 0;">';
+    // A note keeps a column's alignment (`:--`, `:-:`, `--:`).
+    const aligns = notesDialect && /^[\s|:\-]+$/.test(rows[1])
+      ? splitTableRow(rows[1]).map(cell => {
+        const left = cell.startsWith(':');
+        const right = cell.endsWith(':');
+        return left && right ? 'center' : right ? 'right' : left ? 'left' : '';
+      })
+      : [];
 
     rows.forEach((row, idx) => {
       if (idx === 1 && /^[\s|:\-]+$/.test(row)) {
@@ -1164,9 +1517,10 @@ export function mdToHtml(src, opts) {
 
       html += '<tr>';
 
-      cells.forEach(cell => {
+      cells.forEach((cell, col) => {
         const tag = idx === 0 ? 'th' : 'td';
-        html += `<${tag} style="padding: 8px; text-align: left; border-bottom: 1px solid var(--border);">${cell.trim()}</${tag}>`;
+        const align = aligns[col] || '';
+        html += `<${tag}${align ? ` data-align="${align}"` : ''} style="padding: 8px; text-align: ${align || 'left'}; border-bottom: 1px solid var(--border);">${cell.trim()}</${tag}>`;
       });
 
       html += '</tr>';
@@ -1180,7 +1534,11 @@ export function mdToHtml(src, opts) {
   s = s.replace(/^(?:---|\*\*\*|___)\s*$/gm, '<hr>');
 
   // Bold, italic, strikethrough
-  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  // In a note, a single `*` only opens emphasis when text follows it and only
+  // closes it after text, on the same line, as in CommonMark. Otherwise the
+  // `* ` of a bullet paired with the next bullet's and the list became italics.
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+       .replace(notesDialect ? /\*(?![\s*])([^*\n]*[^\s*])\*/g : /\*([^*]+)\*/g, '<em>$1</em>');
   s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
 
   // Headers
@@ -1192,8 +1550,16 @@ export function mdToHtml(src, opts) {
        .replace(/^# (.*)$/gm, '<h1>$1</h1>');
 
   // Ordered lists (1. 2. 3. etc.)
-  s = s.replace(/^(\d+)\. (.*)$/gm, '<oli>$2</oli>');
-  s = s.replace(/(?:^|\n)(<oli>[\s\S]*?)(?=\n(?!<oli>)|$)/g, m => `<ol>${m.trim().replace(/<\/?oli>/g, (t) => t === '<oli>' ? '<li>' : '</li>')}</ol>`);
+  // The notes dialect remembers where a list starts; the number is moved onto
+  // the <ol> at the end, once the paragraph pass has recognised the bare tag.
+  const orderedStarts = [];
+  s = s.replace(/^(\d+)\. (.*)$/gm, (_m, n, text) => {
+    if (notesDialect && n !== '1') { orderedStarts.push(n); return `<oli>___MD_OL_${orderedStarts.length - 1}___${text}</oli>`; }
+    return `<oli>${text}</oli>`;
+  });
+  // In a note the newline before the list stays: dropping it glued the <ol>
+  // onto a bullet right above it, which then took the list in as its own item.
+  s = s.replace(/(^|\n)(<oli>[\s\S]*?)(?=\n(?!<oli>)|$)/g, (_m, prefix, list) => `${notesDialect ? prefix : ''}<ol>${list.trim().replace(/<\/?oli>/g, (t) => t === '<oli>' ? '<li>' : '</li>')}</ol>`);
 
   // GitHub-style task lists (- [ ] / - [x]) → checkbox items. Must run before
   // the generic unordered-list rule so the "- " prefix isn't consumed first.
@@ -1201,12 +1567,23 @@ export function mdToHtml(src, opts) {
   // as a list item. Used by plan mode: plan + progress render as a checklist.
   s = s.replace(/^(?:- |\* )\[([ xX])\] (.*)$/gm, (_m, mark, text) => {
     const done = mark.toLowerCase() === 'x';
+    const token = interactiveTasks ? NOTE_TASK_TOKEN_RE.exec(text) : null;
+    if (token) {
+      return `<uli class="md-task${done ? ' md-task-done' : ''}" data-task-index="${token[1]}" data-done="${done}" data-indent="${token[2]}"><span class="md-task-box" role="checkbox" aria-checked="${done}" tabindex="0"></span><span class="md-task-text">${text.slice(token[0].length)}</span></uli>`;
+    }
     return `<uli class="task-item${done ? ' task-done' : ''}"><span class="task-check" aria-hidden="true"></span><span class="task-text">${text}</span></uli>`;
   });
 
   // Unordered lists. <uli> may carry attributes (task-item class), so the
   // wrapper preserves them when converting <uli ...> → <li ...>.
-  s = s.replace(/^(?:- |\* )(.*)$/gm, '<uli>$1</uli>');
+  if (notesDialect) {
+    s = s.replace(/^([ \t]*)(?:- |\* )(.*)$/gm, (_m, ws, text) => {
+      const indent = _noteTaskIndent(ws);
+      return indent ? `<uli data-indent="${indent}">${text}</uli>` : `<uli>${text}</uli>`;
+    });
+  } else {
+    s = s.replace(/^(?:- |\* )(.*)$/gm, '<uli>$1</uli>');
+  }
   s = s.replace(/(^|\n)((?:<uli\b[^>]*>[^\n]*<\/uli>(?:\n|$))+)/g, (_, prefix, block) =>
     `${prefix}<ul>${block.trim().replace(/<uli\b([^>]*)>/g, '<li$1>').replace(/<\/uli>/g, '</li>')}</ul>`);
 
@@ -1267,6 +1644,21 @@ export function mdToHtml(src, opts) {
     s = s.replace(`___INLINE_CODE_${index}___`, () => block);
   });
 
+  // A task line that ended up somewhere a list cannot render (inside inline
+  // code, a <details> block) keeps its text; it just isn't clickable.
+  if (interactiveTasks) {
+    s = s.replace(/___MD_TASK_\d+_\d+___ ?/g, '');
+    // Stamped last: the paragraph pass above only recognises a bare <ul>.
+    s = s.replace(/<ul><li class="md-task/g, '<ul class="md-tasklist"><li class="md-task');
+  }
+
+  if (orderedStarts.length) {
+    s = s.replace(/<ol><li>___MD_OL_(\d+)___/g, (_m, i) => `<ol start="${orderedStarts[Number(i)]}"><li>`);
+    s = s.replace(/___MD_OL_\d+___/g, '');
+  }
+  if (escapedChars.length) s = s.replace(/___MD_ESC_(\d+)___/g, (_m, i) => escapeHtml(escapedChars[Number(i)]));
+  if (notesDialect) s = s.replace(NOTE_HTML_MARK_TOKEN_RE, (_m, close, tag) => `<${close}${tag}>`);
+  if (notesImages || notesDialect || interactiveTasks) s = scrubNoteHtml(s, { images: notesImages, externalNonce });
   return _useSvgEmoji() ? svgifyEmoji(s, opts) : s;
 }
 

@@ -1,22 +1,76 @@
 # routes/note_routes.py
 """Google Keep-style notes / checklists API."""
 
+import hashlib
 import json
 import uuid
 import logging
-from typing import Dict, Any, Optional
+import functools
+import threading
+from collections import OrderedDict
+from typing import Dict, Any, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from core.database import SessionLocal, Note
+from core.note_writes import (
+    NOTE_WRITE_ATTEMPTS,
+    NoteChanged,
+    commit_if_unchanged,
+    size_refusal,
+    stored_stamp,
+    write_with_retry,
+)
+from core import notes_sharing as sharing
+from core.note_agent_scope import UNDO_FIELDS, agent_edit_view, parse_undo, snapshot, undo_available
+from core.note_versions import (
+    SOURCE_RESTORE,
+    SOURCE_USER,
+    apply_version,
+    delete_note_versions,
+    get_version,
+    history_views,
+    record_version,
+    version_counts,
+    version_view,
+)
+from core.notes_markdown import (
+    normalize_note_color,
+    append_task_line,
+    apply_items_to_content,
+    derive_note_type,
+    effective_content,
+    find_task_index,
+    fold_image_url,
+    fold_legacy_columns,
+    image_urls,
+    legacy_image_url,
+    keep_task_lines,
+    parse_task_lines,
+    reminder_body,
+    remove_image_line,
+    toggle_task,
+)
 from core.middleware import INTERNAL_TOOL_USER
-from src.auth_helpers import require_user
-from src.constants import DATA_DIR
-from src.upload_handler import reserve_upload_references
-from sqlalchemy.orm.attributes import flag_modified
+from src.auth_helpers import require_privilege, require_user
+from src.constants import (
+    DATA_DIR,
+    NOTE_MEDIA_ATTACHMENT_TYPES,
+    NOTE_MEDIA_INLINE_TYPES,
+    NOTE_VIEW_CACHE_MAX_CHARS,
+    NOTE_VIEW_CACHE_SIZE,
+)
+from src.upload_handler import (
+    extract_internal_upload_ids,
+    reserve_upload_ids,
+)
 
 logger = logging.getLogger(__name__)
+
+# What a 409 says when the note changed since the caller last read it.
+NOTE_CONFLICT_MESSAGE = "Note changed elsewhere"
 
 
 # ---------------------------------------------------------------------------
@@ -55,19 +109,181 @@ class NoteUpdate(BaseModel):
     repeat: Optional[str] = None
     sort_order: Optional[int] = None
     agent_session_id: Optional[str] = None
+    # The `updated_at` the client last saw. When it no longer matches, the
+    # note changed elsewhere and the write is refused with 409 instead of
+    # overwriting it. Optional, so clients that don't send it are unaffected.
+    base_updated_at: Optional[str] = None
+
+
+class VersionRestore(BaseModel):
+    # The note version the client showed; another one gets a 409.
+    base_updated_at: Optional[str] = None
+
+
+class TaskToggle(BaseModel):
+    # The task's text as the client saw it, so a stale index can't flip
+    # another task. Optional: older clients send no body.
+    text: Optional[str] = None
+    base_updated_at: Optional[str] = None
+    # The state the person asked for. A flip from a view that hasn't seen a
+    # tick made elsewhere would undo it; a target state can't.
+    done: Optional[bool] = None
+
+
+class TaskAppend(BaseModel):
+    text: str
+    indent: Optional[int] = 0
+
+
+class NoteShareRequest(BaseModel):
+    users: list = []
+    permission: Optional[str] = "view"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _note_to_dict(note: Note) -> Dict[str, Any]:
-    items = None
-    if note.items:
-        try:
-            items = json.loads(note.items)
-        except (json.JSONDecodeError, TypeError):
-            items = None
+def _derived_items(content: Optional[str]) -> Optional[list]:
+    """The legacy `items` shape, read from the task lines in `content`."""
+    tasks = parse_task_lines(content)
+    if not tasks:
+        return None
+    return [
+        {"index": t["index"], "text": t["text"], "done": t["done"], "indent": t["indent"]}
+        for t in tasks
+    ]
+
+
+# Every list read derives the same content, items and type for every note.
+# The derivation is a pure function of the stored columns, so it is kept for
+# rows whose columns have not changed since the last read. The cache is
+# bounded by rows and by the characters it holds (keys and results), so a few
+# very long notes can't pin hundreds of megabytes.
+class _SizedLru:
+    def __init__(self, fn, max_entries: int, max_chars: int):
+        self._fn = fn
+        self._max_entries = max_entries
+        self._max_chars = max_chars
+        self._entries: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._chars = 0
+        self._lock = threading.Lock()
+        functools.update_wrapper(self, fn)
+
+    @staticmethod
+    def _weight(key: tuple, value: tuple) -> int:
+        content, items, _note_type, image_url = value
+        weight = sum(len(part or "") for part in key)
+        if content is not key[0]:
+            weight += len(content or "")
+        if image_url is not key[2]:
+            weight += len(image_url or "")
+        return weight + sum(len(item[1] or "") for item in items or ())
+
+    def __call__(self, *key):
+        with self._lock:
+            hit = self._entries.get(key)
+            if hit is not None:
+                self._entries.move_to_end(key)
+                return hit[0]
+        value = self._fn(*key)
+        weight = self._weight(key, value)
+        if weight > self._max_chars:
+            return value
+        with self._lock:
+            if key not in self._entries:
+                self._entries[key] = (value, weight)
+                self._chars += weight
+            while self._entries and (len(self._entries) > self._max_entries or self._chars > self._max_chars):
+                _old, (_value, dropped) = self._entries.popitem(last=False)
+                self._chars -= dropped
+        return value
+
+    def cache_clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._chars = 0
+
+    def cache_info(self) -> Dict[str, int]:
+        with self._lock:
+            return {"entries": len(self._entries), "chars": self._chars,
+                    "max_entries": self._max_entries, "max_chars": self._max_chars}
+
+
+def _derive_view(
+    content: Optional[str],
+    legacy_items: Optional[str],
+    image_url: Optional[str],
+    note_type: Optional[str],
+) -> Tuple[Optional[str], Optional[tuple], str, Optional[str]]:
+    """(content, items, note_type, image_url) as a note payload shows them."""
+    folded = effective_content(content, legacy_items, image_url)
+    if not folded and content is None:
+        folded = None
+    shown_image = image_url
+    if note_type == "draw":
+        if not shown_image:
+            urls = image_urls(folded)
+            shown_image = urls[-1] if urls else None
+    items = _derived_items(folded)
+    frozen = tuple((i["index"], i["text"], i["done"], i["indent"]) for i in items) if items else None
+    return folded, frozen, derive_note_type(note_type, folded), shown_image
+
+
+_derived_view = _SizedLru(_derive_view, NOTE_VIEW_CACHE_SIZE, NOTE_VIEW_CACHE_MAX_CHARS)
+
+
+def _refuse_oversize(title: Optional[str], content: Optional[str], before: Optional[dict] = None) -> None:
+    """413 when the write would leave the note past a size limit (core.note_writes.size_refusal)."""
+    before = before or {}
+    refusal = size_refusal(title, content, before_title=before.get("title"), before_content=before.get("content"))
+    if refusal:
+        raise HTTPException(413, detail=refusal)
+
+
+def _drawing_image_url(note: Note, content: Optional[str]) -> Optional[str]:
+    """A drawing's canvas image: the column for an unmigrated row, else the
+    last image in content (where the migration and writes append it)."""
+    if note.image_url:
+        return note.image_url
+    urls = image_urls(content)
+    return urls[-1] if urls else None
+
+
+def _write_image_url(note: Note, url: str, note_type: Optional[str] = None) -> None:
+    """Apply a legacy `image_url` write to the note's content.
+
+    `image_url` names the note's single legacy image: a drawing's canvas
+    image, otherwise the last line that is only `![](url)` (what the fold
+    writes). A new URL replaces that image in place, or is appended once when
+    there is none; the same URL again is a no-op; an empty string removes it.
+    """
+    is_drawing = (note_type or note.note_type) == "draw"
+    previous = _drawing_image_url(note, note.content) if is_drawing else legacy_image_url(note.content)
+    if (url or "").strip():
+        note.content = fold_image_url(note.content, url, replace=previous)
+    elif previous:
+        note.content = remove_image_line(note.content, previous)
+    note.image_url = None
+
+
+def _note_access(user: Optional[str], note: Note, db) -> frozenset:
+    """Capabilities `user` has on `note` (read/write/manage/share)."""
+    return sharing.note_access(user, note, db)
+
+
+def _note_to_dict(note: Note, user: Optional[str] = None, shares=None, version_count: int = 0) -> Dict[str, Any]:
+    # `content` is the source of truth. `items`, `note_type` and a drawing's
+    # `image_url` are derived from it so existing clients keep their shape.
+    # A row the startup migration never folded (a non-SQLite database) shows
+    # its legacy `items` and `image_url` the way the migration would store them.
+    content, frozen_items, note_type, image_url = _derived_view(
+        note.content, note.items, note.image_url, note.note_type,
+    )
+    items = (
+        [{"index": i, "text": t, "done": d, "indent": n} for i, t, d, n in frozen_items]
+        if frozen_items else None
+    )
     ai_cls = None
     raw_ai = getattr(note, "ai_classification", None)
     if raw_ai:
@@ -75,13 +291,13 @@ def _note_to_dict(note: Note) -> Dict[str, Any]:
             ai_cls = json.loads(raw_ai)
         except (json.JSONDecodeError, TypeError):
             ai_cls = None
-    return {
+    data = {
         "id": note.id,
         "owner": note.owner,
         "title": note.title,
-        "content": note.content,
+        "content": content,
         "items": items,
-        "note_type": note.note_type,
+        "note_type": note_type,
         "color": note.color,
         "label": note.label,
         "pinned": note.pinned,
@@ -90,41 +306,65 @@ def _note_to_dict(note: Note) -> Dict[str, Any]:
         "source": note.source,
         "session_id": note.session_id,
         "sort_order": note.sort_order or 0,
-        "image_url": note.image_url,
+        "image_url": image_url,
         "gallery_id": getattr(note, "gallery_id", None),
         "repeat": note.repeat or "none",
         "ai_classification": ai_cls,
         "ai_content_hash": getattr(note, "ai_content_hash", None),
         "agent_session_id": getattr(note, "agent_session_id", None),
+        "agent_edit": agent_edit_view(note),
+        # How many earlier versions the history keeps (owner only; None for a collaborator).
+        "version_count": version_count,
         "created_at": note.created_at.isoformat() if note.created_at else None,
         "updated_at": note.updated_at.isoformat() if note.updated_at else None,
     }
+    data.update(sharing.sharing_fields(note, user, shares))
+    if not data["is_owner"]:
+        sharing.strip_owner_private(data)
+    return data
+
+
+def _note_dict_for(db, note: Note, user: Optional[str]) -> Dict[str, Any]:
+    """One note's payload with its grants loaded."""
+    return _note_to_dict(note, user, sharing.shares_by_note(db, [note.id]).get(note.id),
+                         version_counts(db, [note.id]).get(note.id, 0))
+
+
+def _note_conflict(db, note: Note, user: Optional[str], message: str = NOTE_CONFLICT_MESSAGE) -> HTTPException:
+    """The 409 a write answers when the note moved on since the caller read it, carrying the current note."""
+    return HTTPException(409, detail={"message": message, "note": _note_dict_for(db, note, user)})
+
+
+def _conditional_json(request: Request, payload: Dict[str, Any]) -> Response:
+    """A JSON response with a strong ETag over its exact body.
+
+    The Notes panel re-reads the list every few seconds; when nothing it
+    would see has changed, it gets a 304 with no body instead of the list.
+    The tag is computed from the bytes sent, so any change a reader would
+    see (an edit, a deleted note, a share added or removed) changes it.
+    """
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+    sent = request.headers.get("if-none-match", "")
+    if etag in [tag.strip().removeprefix("W/") for tag in sent.split(",")]:
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+def _fold_legacy_columns(note: Note) -> None:
+    """Move a row the startup migration skipped into content before a write.
+
+    Shared with the agent tool (`core.notes_markdown.fold_legacy_columns`):
+    unreadable `items` are left in place for the migration to retry.
+    """
+    fold_legacy_columns(note)
 
 
 def _reminder_text_from_note(note: Note) -> tuple[str, str]:
     """Return the reminder title/body from a stored note row."""
     title = (note.title or "Note reminder").strip() or "Note reminder"
-    if note.items:
-        try:
-            items = json.loads(note.items)
-        except (json.JSONDecodeError, TypeError):
-            items = None
-        if isinstance(items, list):
-            pending: list[str] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("done") or item.get("checked"):
-                    continue
-                text = str(item.get("text") or "").strip()
-                if text:
-                    pending.append(text)
-            if pending:
-                shown = "\n".join(f"- {text}" for text in pending[:8])
-                extra = f"\n...and {len(pending) - 8} more" if len(pending) > 8 else ""
-                return title, f"Pending ({len(pending)}):\n{shown}{extra}"
-            return title, f"{len(items)} item{'s' if len(items) != 1 else ''}"
-    return title, (note.content or "").strip()[:400]
+    return title, reminder_body(effective_content(note.content, note.items, getattr(note, "image_url", None)))
 
 
 
@@ -276,9 +516,9 @@ async def dispatch_reminder(
                         r").*",
                         _re.IGNORECASE,
                     )
-                    # Echo of the prompt's "Pending:" / "<N> pending" tail.
+                    # Echo of the prompt's "Pending (N):" / "<N> pending" tail.
                     _echo = _re.compile(
-                        r"^\s*(?:pending\s*[:.]|(?:\d+|one|two|three|four|five)\s+pending\b)",
+                        r"^\s*(?:pending\s*(?:\(\d+\))?\s*[:.]|(?:\d+|one|two|three|four|five)\s+pending\b)",
                         _re.IGNORECASE,
                     )
                     lines = [ln for ln in synthesis.splitlines() if ln.strip()]
@@ -600,10 +840,11 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
         # did not.
         return require_user(request) or None
 
-    def _reserve_note_uploads(owner: Optional[str], *values) -> None:
-        missing_id = reserve_upload_references(upload_handler, owner, *values)
-        if missing_id:
-            raise HTTPException(409, f"Referenced upload is no longer available: {missing_id}")
+    def _checked_color(value):
+        try:
+            return normalize_note_color(value)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
 
     def _is_admin_or_single_user(request: Request, user: str | None) -> bool:
         if user == INTERNAL_TOOL_USER:
@@ -621,6 +862,62 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
             return bool(auth_mgr.is_admin(user))
         except Exception:
             return False
+
+    def _note_upload_refs(note: Note) -> set:
+        """Uploads the stored note references: what the media route serves."""
+        refs = extract_internal_upload_ids(effective_content(note.content, note.items, note.image_url) or "")
+        refs |= extract_internal_upload_ids(note.image_url or "")
+        refs |= extract_internal_upload_ids(note.color or "")
+        return refs
+
+    def _reserve_new_note_uploads(owner: Optional[str], before: set, note: Note) -> None:
+        # Reserve from the note as it will be stored, not from the request
+        # fields: the stored content is what the media route serves from, so
+        # the two cannot disagree about which uploads the note references.
+        # Only uploads this write introduces are reserved for the writer. The
+        # ones already in the note were reserved when they were inserted, and
+        # on a shared note they can belong to the owner or another
+        # collaborator, so re-reserving them as the writer would refuse.
+        missing_id = reserve_upload_ids(upload_handler, owner, _note_upload_refs(note) - before)
+        if missing_id:
+            raise HTTPException(409, f"Referenced upload is no longer available: {missing_id}")
+
+    def _reserve_restored_uploads(user: Optional[str], before: set, note: Note) -> None:
+        # A version holds only what the note once stored, so each upload a
+        # restore brings back was reserved when someone who could edit the
+        # note put it there, and on a shared note that can be a collaborator.
+        # Reserve it for the account that owns it: reserving it as the
+        # restoring owner would refuse a collaborator's image. One deleted
+        # since has no owner to look up and is still refused.
+        for upload_id in sorted(_note_upload_refs(note) - before):
+            info = upload_handler.get_upload_info(upload_id) if upload_handler is not None else None
+            owner = info.get("owner") if info else user
+            if reserve_upload_ids(upload_handler, owner, {upload_id}):
+                raise HTTPException(409, f"Referenced upload is no longer available: {upload_id}")
+
+    def _load_note(db, note_id: str, user: Optional[str], need: str) -> tuple:
+        """The note and the caller's capabilities, or the matching error.
+
+        No read access is the same 404 as a missing note, so the route is not
+        an existence oracle. A collaborator who can see the note but lacks
+        `need` gets 403.
+        """
+        note = db.query(Note).filter(Note.id == note_id).first()
+        if not note:
+            raise HTTPException(404, "Note not found")
+        caps = _note_access(user, note, db)
+        if "read" not in caps:
+            raise HTTPException(404, "Note not found")
+        if need not in caps:
+            raise HTTPException(403, "Only the note's owner can do that" if need in ("manage", "share")
+                                else "This note is shared with you as view only")
+        return note, caps
+
+    def _sharing_user(request: Request) -> str:
+        user = sharing.normalize_user(require_privilege(request, "can_share_notes"))
+        if not user:
+            raise HTTPException(400, "Sharing needs signed-in accounts")
+        return user
 
     # --- LIST ---
     @router.get("")
@@ -646,29 +943,44 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
                 notes = q.order_by(Note.updated_at.desc()).all()
             else:
                 notes = q.order_by(Note.pinned.desc(), Note.sort_order.asc(), Note.updated_at.desc()).all()
-            return {"notes": [_note_to_dict(n) for n in notes]}
+            # Notes shared with me follow, in the active view only: archiving
+            # is the owner's filing, not something a collaborator browses.
+            if user is not None and archived is not True:
+                sq = sharing.shared_with_me_query(db, user).filter(Note.archived == False)  # noqa: E712
+                if label:
+                    sq = sq.filter(Note.label == label)
+                notes += sq.order_by(Note.updated_at.desc()).all()
+            grants = sharing.shares_by_note(db, [n.id for n in notes])
+            counts = version_counts(db, [n.id for n in notes])
+            payload = {
+                "notes": [_note_to_dict(n, user, grants.get(n.id), counts.get(n.id, 0)) for n in notes],
+                "me": user,
+            }
         finally:
             db.close()
+        return _conditional_json(request, payload)
 
     # --- CREATE ---
     @router.post("")
     def create_note(request: Request, body: NoteCreate):
         user = _owner(request)
-        _reserve_note_uploads(
-            user,
-            body.image_url,
-            body.color,
-            body.content,
-            json.dumps(body.items) if body.items is not None else None,
-        )
+        body.color = _checked_color(body.color)
+        # Checklist items and the legacy single image are written into the
+        # markdown content; the columns stay empty for new rows.
+        content = body.content
+        if body.items is not None:
+            content = apply_items_to_content(content, body.items)
+        if body.image_url:
+            content = fold_image_url(content, body.image_url)
+        _refuse_oversize(body.title, content)
         db = SessionLocal()
         try:
             note = Note(
                 id=str(uuid.uuid4()),
                 owner=user,
                 title=body.title,
-                content=body.content,
-                items=json.dumps(body.items) if body.items is not None else None,
+                content=content,
+                items=None,
                 note_type=body.note_type,
                 color=body.color,
                 label=body.label,
@@ -676,17 +988,29 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
                 due_date=body.due_date,
                 source=body.source,
                 session_id=body.session_id,
-                image_url=body.image_url,
+                image_url=None,
                 gallery_id=body.gallery_id,
                 repeat=body.repeat or "none",
                 sort_order=body.sort_order if body.sort_order is not None else 0,
             )
+            _reserve_new_note_uploads(user, set(), note)
             db.add(note)
             db.commit()
             db.refresh(note)
-            return _note_to_dict(note)
+            return _note_to_dict(note, user)
         finally:
             db.close()
+
+    # --- SHARE TARGETS ---
+    # Declared before GET /{note_id} so the literal path is not taken as an id.
+    # Usernames only, and only for accounts allowed to share.
+    @router.get("/share-targets")
+    def share_targets(request: Request):
+        user = sharing.normalize_user(require_privilege(request, "can_share_notes"))
+        names = sharing.known_usernames(getattr(request.app.state, "auth_manager", None)) or set()
+        if not user:
+            names = set()
+        return {"users": [{"username": n} for n in sorted(names) if n != user]}
 
     # --- GET ONE ---
     @router.get("/{note_id}")
@@ -694,14 +1018,8 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
         user = _owner(request)
         db = SessionLocal()
         try:
-            note = db.query(Note).filter(Note.id == note_id).first()
-            if not note:
-                raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
-                raise HTTPException(404, "Note not found")
-            return _note_to_dict(note)
+            note, _caps = _load_note(db, note_id, user, "read")
+            return _note_dict_for(db, note, user)
         finally:
             db.close()
 
@@ -709,33 +1027,73 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
     @router.put("/{note_id}")
     def update_note(request: Request, note_id: str, body: NoteUpdate):
         user = _owner(request)
+        # Only when sent: assigning a field marks it as sent, and the
+        # owner-only check below goes by the fields a request names.
+        if "color" in body.model_fields_set:
+            body.color = _checked_color(body.color)
+        # A write without a base is re-applied to the newer row when it loses
+        # a race; one with a base asked for exactly that version, so it gets
+        # the 409 the client handles.
+        for _attempt in range(NOTE_WRITE_ATTEMPTS):
+            try:
+                return _update_note_once(user, note_id, body)
+            except NoteChanged:
+                if body.base_updated_at is not None:
+                    break
         db = SessionLocal()
         try:
-            note = db.query(Note).filter(Note.id == note_id).first()
-            if not note:
-                raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
-                raise HTTPException(404, "Note not found")
+            note, _caps = _load_note(db, note_id, user, "read")
+            raise _note_conflict(db, note, user)
+        finally:
+            db.close()
 
-            _reserve_note_uploads(
-                user,
-                body.image_url,
-                body.color,
-                body.content,
-                json.dumps(body.items) if body.items is not None else None,
-            )
+    def _update_note_once(user: Optional[str], note_id: str, body: NoteUpdate) -> Dict[str, Any]:
+        db = SessionLocal()
+        try:
+            # Read the stamp first: a write landing before the row is loaded
+            # then fails the compare instead of being overwritten.
+            stamp = stored_stamp(db, note_id)
+            note, caps = _load_note(db, note_id, user, "write")
+            # Pin, archive, order, colour, tag, reminder and the agent-session
+            # link are the owner's. The dedicated /pin and /archive routes are
+            # owner-only, and this generic route must not be a side door.
+            if "manage" not in caps:
+                blocked = sharing.owner_only_fields_in(body.model_fields_set)
+                if blocked:
+                    raise HTTPException(403, f"Only the note's owner can change: {', '.join(blocked)}")
+            # `items` rewrites the task lines of the stored content by position,
+            # so it has no defined meaning next to a whole new `content`. An
+            # empty list is the one exception: it says "no tasks", so the text
+            # is written without them.
+            if body.content is not None and body.items:
+                raise HTTPException(400, "Send either content or items, not both")
+            current = note.updated_at.isoformat() if note.updated_at else None
+            if body.base_updated_at is not None and body.base_updated_at != current:
+                raise _note_conflict(db, note, user)
+
+            refs_before = _note_upload_refs(note)
+            before = snapshot(note)
             if body.title is not None:
                 note.title = body.title
             # Omitted fields preserve their values; explicit null clears the
             # nullable fields used by the editor's removal controls.
             supplied = body.model_fields_set
-            if "content" in supplied:
-                note.content = body.content
-            if "items" in supplied:
-                note.items = json.dumps(body.items) if body.items is not None else None
-                flag_modified(note, "items")
+            if body.content is not None or body.items is not None or body.image_url is not None:
+                _fold_legacy_columns(note)
+            if body.content is not None:
+                # Text on its own (an agent or API client that edited the
+                # prose) keeps the task lines; the note window sends its base
+                # and the whole document, so its text is taken as written.
+                keeps_tasks = body.items is None and body.base_updated_at is None
+                note.content = keep_task_lines(note.content, body.content) if keeps_tasks else body.content
+            # Writers that still send `items` (the current form, card edits,
+            # older API clients) rewrite the task lines in place.
+            if body.items is not None:
+                note.content = apply_items_to_content(note.content, body.items)
+            # `image_url` is folded into content, never stored. A re-saved
+            # drawing replaces its previous canvas image instead of stacking.
+            if body.image_url is not None:
+                _write_image_url(note, body.image_url, body.note_type)
             if body.note_type is not None:
                 note.note_type = body.note_type
             if "color" in supplied:
@@ -748,8 +1106,6 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
                 note.archived = body.archived
             if "due_date" in supplied:
                 note.due_date = body.due_date
-            if "image_url" in supplied:
-                note.image_url = body.image_url
             if "gallery_id" in supplied:
                 note.gallery_id = body.gallery_id
             if body.repeat is not None:
@@ -759,9 +1115,114 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
             if "agent_session_id" in supplied:
                 note.agent_session_id = body.agent_session_id
 
-            db.commit()
+            _refuse_oversize(note.title, note.content, before)
+            _reserve_new_note_uploads(user, refs_before, note)
+            record_version(db, note, before, SOURCE_USER, author=user)
+            commit_if_unchanged(db, note, stamp)
             db.refresh(note)
-            return _note_to_dict(note)
+            return _note_dict_for(db, note, user)
+        finally:
+            db.close()
+
+    # --- UNDO THE LAST AGENT EDIT ---
+    @router.post("/{note_id}/agent-undo")
+    def undo_agent_edit(request: Request, note_id: str):
+        """Put back the note as it was before its last agent edit (core.note_agent_scope.UNDO_FIELDS).
+
+        Only while the note still holds exactly what the agent wrote: after
+        anyone else's change it answers 409 with the note as it is, and
+        nothing is undone. Owner only, like the runs themselves.
+        """
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            stamp = stored_stamp(db, note_id)
+            note, _caps = _load_note(db, note_id, user, "manage")
+            undo = parse_undo(note.agent_undo)
+            if not undo:
+                raise HTTPException(404, "No agent edit to undo")
+            if not undo_available(note, undo):
+                raise HTTPException(409, detail={"message": "The note changed after the agent's edit",
+                                                 "note": _note_dict_for(db, note, user)})
+            before = snapshot(note)
+            for field, value in undo["before"].items():
+                if field in UNDO_FIELDS:
+                    setattr(note, field, value)
+            note.agent_undo = None
+            # What the agent wrote stays in the history, so the Undo can be undone.
+            record_version(db, note, before, SOURCE_RESTORE, author=user)
+            try:
+                commit_if_unchanged(db, note, stamp)
+            except NoteChanged:
+                db.expire_all()
+                note, _caps = _load_note(db, note_id, user, "read")
+                raise _note_conflict(db, note, user)
+            db.refresh(note)
+            return _note_dict_for(db, note, user)
+        finally:
+            db.close()
+
+    # --- VERSION HISTORY (core.note_versions) ---
+    @router.get("/{note_id}/versions")
+    def list_note_versions(request: Request, note_id: str):
+        """The note's earlier versions, newest first, without their full text. Owner only."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            note, _caps = _load_note(db, note_id, user, "manage")
+            return {"versions": history_views(db, note, user)}
+        finally:
+            db.close()
+
+    @router.get("/{note_id}/versions/{version_id}")
+    def get_note_version(request: Request, note_id: str, version_id: int):
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            note, _caps = _load_note(db, note_id, user, "manage")
+            row = get_version(db, note.id, version_id)
+            if row is None:
+                raise HTTPException(404, "Version not found")
+            return version_view(row, note, full=True)
+        finally:
+            db.close()
+
+    @router.post("/{note_id}/versions/{version_id}/restore")
+    def restore_note_version(request: Request, note_id: str, version_id: int,
+                             body: Optional[VersionRestore] = Body(default=None)):
+        """Put a version back. The state it replaces becomes a version, so this can be undone too.
+
+        With `base_updated_at`, only onto that version of the note; a note
+        that changed meanwhile (then, or while restoring) is a 409 carrying
+        the note as it is, and nothing is restored. An upload the version
+        shows that has since been deleted is a 409 as well.
+        """
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            stamp = stored_stamp(db, note_id)
+            note, _caps = _load_note(db, note_id, user, "manage")
+            row = get_version(db, note.id, version_id)
+            if row is None:
+                raise HTTPException(404, "Version not found")
+            current = note.updated_at.isoformat() if note.updated_at else None
+            if body is not None and body.base_updated_at is not None and body.base_updated_at != current:
+                raise _note_conflict(db, note, user)
+            refs_before = _note_upload_refs(note)
+            before = snapshot(note)
+            apply_version(note, row)
+            _reserve_restored_uploads(user, refs_before, note)
+            kept = record_version(db, note, before, SOURCE_RESTORE, author=user)
+            try:
+                commit_if_unchanged(db, note, stamp)
+            except NoteChanged:
+                db.expire_all()
+                note, _caps = _load_note(db, note_id, user, "read")
+                raise _note_conflict(db, note, user)
+            db.refresh(note)
+            # The note, plus the version this restore kept of what it replaced:
+            # restoring that one undoes the restore.
+            return {**_note_dict_for(db, note, user), "undo_version_id": kept.id if kept is not None else None}
         finally:
             db.close()
 
@@ -771,13 +1232,10 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
         user = _owner(request)
         db = SessionLocal()
         try:
-            note = db.query(Note).filter(Note.id == note_id).first()
-            if not note:
-                raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
-                raise HTTPException(404, "Note not found")
+            # Owner only. A collaborator leaves through DELETE /{id}/share/{me}.
+            note, _caps = _load_note(db, note_id, user, "manage")
+            sharing.delete_note_shares(db, note.id)
+            delete_note_versions(db, [note.id])
             db.delete(note)
             db.commit()
             return {"ok": True}
@@ -790,13 +1248,7 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
         user = _owner(request)
         db = SessionLocal()
         try:
-            note = db.query(Note).filter(Note.id == note_id).first()
-            if not note:
-                raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
-                raise HTTPException(404, "Note not found")
+            note, _caps = _load_note(db, note_id, user, "manage")
             note.pinned = not note.pinned
             db.commit()
             return {"ok": True, "pinned": note.pinned}
@@ -809,13 +1261,7 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
         user = _owner(request)
         db = SessionLocal()
         try:
-            note = db.query(Note).filter(Note.id == note_id).first()
-            if not note:
-                raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
-                raise HTTPException(404, "Note not found")
+            note, _caps = _load_note(db, note_id, user, "manage")
             note.archived = not note.archived
             db.commit()
             return {"ok": True, "archived": note.archived}
@@ -824,29 +1270,197 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
 
     # --- TOGGLE CHECKLIST ITEM ---
     @router.post("/{note_id}/items/{index}/toggle")
-    def toggle_item(request: Request, note_id: str, index: int):
+    def toggle_item(request: Request, note_id: str, index: int, body: Optional[TaskToggle] = Body(default=None)):
+        """Flip one task. `text` is the task's text as the client saw it.
+
+        With a text, a task moved by a line inserted or removed above it is
+        still the one flipped, and a task that is gone (or now ambiguous) is a
+        409 carrying the current note. The flip is re-applied to the newest
+        row when another write lands first, so concurrent ticks all count.
+        With `done`, the task is set to that state rather than flipped, so a
+        tick from a view that is behind can't undo the same tick made elsewhere.
+        """
+        user = _owner(request)
+        wanted = body.text if body else None
+        db = SessionLocal()
+        try:
+            def load():
+                return _load_note(db, note_id, user, "write")[0]
+
+            def flip(note):
+                if body and body.base_updated_at is not None:
+                    current = note.updated_at.isoformat() if note.updated_at else None
+                    if body.base_updated_at != current:
+                        raise _note_conflict(db, note, user)
+                before = snapshot(note)
+                _fold_legacy_columns(note)
+                if not parse_task_lines(note.content):
+                    raise HTTPException(400, "Note has no checklist items")
+                target = find_task_index(note.content, index, wanted)
+                if target is None:
+                    raise _note_conflict(db, note, user, "That checklist item changed elsewhere")
+                try:
+                    note.content, item = toggle_task(note.content, target, body.done if body else None)
+                except IndexError:
+                    raise HTTPException(400, f"Item index {index} out of range")
+                record_version(db, note, before, SOURCE_USER, author=user)
+                return item
+
+            try:
+                note, item = write_with_retry(db, note_id, load, flip)
+            except NoteChanged:
+                note = load()
+                raise _note_conflict(db, note, user)
+            data = _note_dict_for(db, note, user)
+            return {"ok": True, "item": item, "items": data["items"], "note": data}
+        finally:
+            db.close()
+
+    # --- APPEND CHECKLIST ITEM ---
+    @router.post("/{note_id}/items")
+    def append_item(request: Request, note_id: str, body: TaskAppend):
+        """Append one open task line server-side.
+
+        Quick-add used to PUT the whole checklist, which raced any other
+        write to the same note. This reads the stored content and adds the
+        line in one transaction.
+        """
+        user = _owner(request)
+        text = " ".join((body.text or "").split())
+        if not text:
+            raise HTTPException(400, "text required")
+        db = SessionLocal()
+        try:
+            def load():
+                return _load_note(db, note_id, user, "write")[0]
+
+            def add(note):
+                refs_before = _note_upload_refs(note)
+                before = snapshot(note)
+                _fold_legacy_columns(note)
+                note.content, item = append_task_line(note.content, text, body.indent or 0)
+                _refuse_oversize(note.title, note.content, before)
+                _reserve_new_note_uploads(user, refs_before, note)
+                record_version(db, note, before, SOURCE_USER, author=user)
+                return item
+
+            try:
+                note, item = write_with_retry(db, note_id, load, add)
+            except NoteChanged:
+                note = load()
+                raise _note_conflict(db, note, user)
+            return {"ok": True, "item": item, "note": _note_dict_for(db, note, user)}
+        finally:
+            db.close()
+
+    # --- SHARING ---
+    @router.get("/{note_id}/shares")
+    def list_shares(request: Request, note_id: str):
         user = _owner(request)
         db = SessionLocal()
         try:
-            note = db.query(Note).filter(Note.id == note_id).first()
-            if not note:
-                raise HTTPException(404, "Note not found")
-            # SECURITY: strict ownership — previously `note.owner and note.owner != user`
-            # let any user touch a row whose owner field was null/empty.
-            if user is not None and note.owner != user:
-                raise HTTPException(404, "Note not found")
-            if not note.items:
-                raise HTTPException(400, "Note has no checklist items")
-            items = json.loads(note.items)
-            if index < 0 or index >= len(items):
-                raise HTTPException(400, f"Item index {index} out of range")
-            items[index]["done"] = not items[index].get("done", False)
-            note.items = json.dumps(items)
-            flag_modified(note, "items")
-            db.commit()
-            return {"ok": True, "items": items}
+            note, _caps = _load_note(db, note_id, user, "share")
+            grants = sharing.shares_by_note(db, [note.id]).get(note.id, [])
+            return {"shared_with": sharing.roster(grants)}
         finally:
             db.close()
+
+    @router.post("/{note_id}/share")
+    def share_note(request: Request, note_id: str, body: NoteShareRequest):
+        """Grant `view` or `edit` to accounts on this instance (owner only).
+
+        Upserts: sharing again with another permission flips it. Unknown
+        accounts and the owner are skipped and reported back.
+        """
+        user = _sharing_user(request)
+        permission = sharing.normalize_permission(body.permission)
+        if permission is None:
+            raise HTTPException(400, "permission must be 'view' or 'edit'")
+        db = SessionLocal()
+        try:
+            note, _caps = _load_note(db, note_id, user, "share")
+            valid = sharing.known_usernames(getattr(request.app.state, "auth_manager", None))
+            if valid is None:
+                raise HTTPException(503, "Authentication service unavailable")
+            requested = [sharing.normalize_user(u) for u in (body.users or []) if isinstance(u, str)]
+            written = sharing.upsert_shares(db, note, requested, permission, valid)
+            db.commit()
+            grants = sharing.shares_by_note(db, [note.id]).get(note.id, [])
+            return {
+                "ok": True,
+                "shared": written,
+                "skipped": [u for u in requested if u and u not in written],
+                "shared_with": sharing.roster(grants),
+            }
+        finally:
+            db.close()
+
+    @router.delete("/{note_id}/share/{username}")
+    def unshare_note(request: Request, note_id: str, username: str):
+        """The owner removes anyone; a collaborator can only remove themselves."""
+        user = _owner(request)
+        target = sharing.normalize_user(username)
+        db = SessionLocal()
+        try:
+            note, caps = _load_note(db, note_id, user, "read")
+            leaving = bool(user) and target == sharing.normalize_user(user) and "share" not in caps
+            if "share" not in caps and not leaving:
+                raise HTTPException(403, "Only the note's owner can remove other people")
+            sharing.remove_share(db, note.id, target)
+            db.commit()
+            return {"ok": True, "left": leaving}
+        finally:
+            db.close()
+
+    # --- NOTE-SCOPED MEDIA ---
+    @router.get("/{note_id}/media/{upload_id}")
+    def note_media(request: Request, note_id: str, upload_id: str):
+        """An image in a note, for anyone who can read the note.
+
+        `/api/upload/{id}` is owner-only, so on a shared note the owner's and
+        each collaborator's uploads would break for the others. This serves an
+        upload only when the note's content references it and the upload
+        belongs to the note's owner or a current collaborator, so read access
+        to a note never reaches an upload the note does not show, nor one a
+        stranger's reference points at. An image a collaborator added stops
+        loading here once they leave the note or are removed from it.
+        """
+        user = _owner(request)
+        if upload_handler is None or not upload_handler.validate_upload_id(upload_id):
+            raise HTTPException(404, "File not found")
+        db = SessionLocal()
+        try:
+            note, _caps = _load_note(db, note_id, user, "read")
+            referenced = extract_internal_upload_ids(effective_content(note.content, note.items, note.image_url) or "")
+            referenced |= extract_internal_upload_ids(note.image_url or "")
+            # Whose uploads this note may show: its owner's and its current
+            # collaborators'. A reference alone is not enough, because not
+            # every writer of note content reserves what it references.
+            allowed_owners = {sharing.normalize_user(note.owner)}
+            allowed_owners |= {
+                sharing.normalize_user(share.shared_with)
+                for share in sharing.shares_by_note(db, [note.id]).get(note.id, [])
+            }
+        finally:
+            db.close()
+        if upload_id not in referenced:
+            raise HTTPException(404, "File not found")
+        from routes.upload_routes import UPLOAD_RESPONSE_HEADERS, resolve_upload_file_path
+        from fastapi.responses import FileResponse
+        info = upload_handler.get_upload_info(upload_id) or {}
+        if not info or sharing.normalize_user(info.get("owner")) not in allowed_owners:
+            raise HTTPException(404, "File not found")
+        path = resolve_upload_file_path(upload_handler, upload_id)
+        import mimetypes as _mt
+        mime = str(info.get("mime") or _mt.guess_type(path)[0] or "").split(";")[0].strip().lower()
+        # Notes show uploads as images only. Any other type is refused rather
+        # than served inline from this origin.
+        headers = dict(UPLOAD_RESPONSE_HEADERS)
+        if mime in NOTE_MEDIA_ATTACHMENT_TYPES:
+            headers["Content-Disposition"] = "attachment"
+        elif mime not in NOTE_MEDIA_INLINE_TYPES:
+            raise HTTPException(404, "File not found")
+        return FileResponse(path, media_type=mime, headers=headers)
 
     # --- FIRE REMINDER ---
     @router.post("/fire-reminder")

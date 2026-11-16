@@ -497,7 +497,7 @@ _PRIVATE_ACTION_READS: Mapping[str, frozenset[str]] = MappingProxyType(
         "manage_contact": frozenset({"list", "search", "find"}),
         "manage_documents": frozenset({"list", "read", "view", "open", "get"}),
         "manage_memory": frozenset({"list", "search"}),
-        "manage_notes": frozenset({"list", "search", "find", "view"}),
+        "manage_notes": frozenset({"list", "search", "find", "view", "get", "read", "show", "open"}),
         "manage_research": frozenset({"list", "read", "open", "view", "get"}),
         "manage_session": frozenset({"list", "switch", "open", "select", "view"}),
         "manage_skills": frozenset({"list", "index", "view", "view_ref", "search"}),
@@ -869,6 +869,9 @@ _EXTERNAL_MESSAGE_SOURCE_PREFIXES = ("web page:",)
 _CONTROL_PLANE_CONTEXT_SOURCES = frozenset(
     {
         "skills",
+        # The owner's skill names and descriptions (ChatProcessor's index of
+        # the same skills as above): reads stay open, changes still ask.
+        "available skills index",
         "client runtime context",
         "backend runtime context",
         "integrations",
@@ -1068,6 +1071,48 @@ def _is_authorized_local_mcp_continuation(
     return has_local_tool
 
 
+def _note_edit_scope_decision(tool_name: Any, content: Any) -> "ToolGateDecision | None":
+    """The gate's answer for manage_notes in a chat started from a note, or None to decide as usual.
+
+    Reads pass to the usual rules. A change goes to the tool, which allows it
+    on the chat's own note only and refuses the rest with a clear error (no
+    prompt for something that cannot happen). On a shared note, whose text a
+    collaborator may have written, every change to it asks first, whether or
+    not other untrusted context was seen. A private note's change needs no
+    prompt: it is the owner's own text, and it can be undone.
+    """
+    if tool_name != "manage_notes":
+        return None
+    from core.note_agent_scope import current_note_edit_scope
+    scope = current_note_edit_scope()
+    if scope is None:
+        return None
+    # Parse exactly as manage_notes does, {"body": {...}} envelope included,
+    # so the gate judges the call the tool will run.
+    from src.tool_utils import _parse_tool_args
+    try:
+        payload: Any = _parse_tool_args(content)
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, Mapping):
+        payload = {}
+    ref = str(payload.get("id") or payload.get("note_id") or payload.get("noteId") or "").strip()
+    if not (capabilities_for_action(tool_name, content).effects - {ToolEffect.READ_PRIVATE}):
+        # Reading the chat's own note back (after an edit, or to retry one
+        # the tool refused as stale) shows nothing the run was not already
+        # given. Every other read keeps the usual rule.
+        if ref and scope.note_id.startswith(ref):
+            return ToolGateDecision(True)
+        return None
+    if scope.shared:
+        from core.note_agent_scope import SCOPED_WRITE_ACTIONS
+        action = str(payload.get("action") or "").replace("-", "_").strip().lower()
+        if action in SCOPED_WRITE_ACTIONS and scope.might_target(ref):
+            from core.note_agent_scope import SCOPE_SHARED_APPROVAL_REASON
+            return ToolGateDecision(False, SCOPE_SHARED_APPROVAL_REASON)
+    return ToolGateDecision(True)
+
+
 @dataclass
 class ToolRunSecurityContext:
     """Server-owned integrity state for one agent run."""
@@ -1153,6 +1198,9 @@ class ToolRunSecurityContext:
             return ToolGateDecision(True)
         if isinstance(tool_name, str) and tool_name in self.unattended_tools:
             return ToolGateDecision(True)
+        scoped = _note_edit_scope_decision(tool_name, content)
+        if scoped is not None:
+            return scoped
         if not self.external_untrusted_context_seen:
             return ToolGateDecision(True)
 

@@ -797,7 +797,10 @@ async def test_streaming_chat_persists_selected_route_cost_classification(
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_route_does_not_save_or_postprocess_terminal_agent_error(monkeypatch):
+async def test_chat_stream_route_saves_only_the_failure_for_terminal_agent_error(monkeypatch):
+    # A run that fails before any output still leaves a turn saying why it
+    # stopped: nobody may be watching the stream (a run started from a note),
+    # and without it the reopened chat shows the question and nothing else.
     captured = {}
     error_chunk = 'event: error\ndata: {"status": 401, "error": "invalid key"}\n\n'
     endpoint = _chat_stream_endpoint(
@@ -812,7 +815,35 @@ async def test_chat_stream_route_does_not_save_or_postprocess_terminal_agent_err
     chunks = [chunk async for chunk in response.body_iterator]
 
     assert error_chunk in chunks
-    assert "saved" not in captured
+    assert "data: [DONE]\n\n" not in chunks
+    assert len(captured["saved"]) == 1
+    saved_args, _saved_kwargs = captured["saved"][0]
+    assert saved_args[3] == "[Agent stopped: Model request failed (HTTP 401)]"
+    assert "invalid key" not in str(saved_args)
+    assert saved_args[4]["failed"] is True
+    assert saved_args[4]["failure"] == {"status": 401, "message": "Model request failed (HTTP 401)"}
+    assert "post_processed" not in captured
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_route_saves_the_loop_failure_text_once(monkeypatch):
+    # The loop's own "no usable output" reply comes first; the error after it
+    # is saved once, with that text, and an agent_terminal already saved wins.
+    captured = {}
+    final = 'data: {"type": "final_response", "content": "The model provider returned no usable output."}\n\n'
+    error_chunk = 'event: error\ndata: {"status": 504, "error": "Read timeout"}\n\n'
+    endpoint = _chat_stream_endpoint(
+        monkeypatch, "agent", captured, agent_chunks=[final, error_chunk, error_chunk], capture_completion=True,
+    )
+
+    response = await endpoint(_RouteRequest("agent"))
+    [chunk async for chunk in response.body_iterator]
+
+    assert len(captured["saved"]) == 1
+    assert captured["saved"][0][0][3] == (
+        "The model provider returned no usable output.\n\n"
+        "[Agent stopped: Model request failed (HTTP 504)]"
+    )
     assert "post_processed" not in captured
 
 

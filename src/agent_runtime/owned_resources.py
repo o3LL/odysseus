@@ -46,9 +46,24 @@ def _revision(row, namespace):
     return f"{created.isoformat()}:{updated.isoformat()}:{version}"
 
 
+def _note_shared_with(owner, row):
+    """Whether `row` is a note shared with `owner`. The notes tool still checks
+    the share's permission (view or edit) and the owner-only fields itself."""
+    from core.database import SessionLocal
+    from core import notes_sharing
+    if not owner or not isinstance(getattr(row, "id", None), str):
+        return False
+    db = SessionLocal()
+    try:
+        return "read" in notes_sharing.note_access(owner, row, db)
+    finally:
+        db.close()
+
+
 def _record(namespace, owner, thread, row):
-    if (getattr(row, "owner", None) != owner or not isinstance(getattr(row, "id", None), str)
-            or row.id in {"", "*"}):
+    if (not isinstance(getattr(row, "id", None), str) or row.id in {"", "*"}
+            or (getattr(row, "owner", None) != owner
+                and not (namespace == "notes" and _note_shared_with(owner, row)))):
         raise ResourceIdentityError("Record ownership is unresolved")
     linked = str(getattr(row, "session_id", "") or "") if namespace == "documents" else row.id if namespace == "threads" else ""
     return OwnedResource(namespace, owner, thread, namespace, row.id, _revision(row, namespace), linked)
@@ -59,7 +74,13 @@ def _row(namespace, identifier, owner):
     model = {"documents": Document, "threads": Session, "notes": Note}[namespace]
     db = SessionLocal()
     try:
-        row = db.query(model).filter(model.id == identifier, model.owner == owner).first()
+        if namespace == "notes":
+            # A note shared with the caller resolves too; see _note_shared_with.
+            from core import notes_sharing
+            query = notes_sharing.readable_notes_query(db, owner).filter(Note.id == identifier)
+        else:
+            query = db.query(model).filter(model.id == identifier, model.owner == owner)
+        row = query.first()
         if row is None or (namespace == "documents" and not row.is_active):
             raise ResourceIdentityError("Owned record is missing or inaccessible")
         db.expunge(row)
@@ -354,14 +375,22 @@ def resolve_owned_operation(operation, *, owner, thread_id, request_id="", docum
         else:
             identifier = _selector(args, ("id", "note_id", "noteId"))
             from core.database import SessionLocal, Note
+            from core import notes_sharing
             db = SessionLocal()
             try:
-                q = db.query(Note).filter(Note.owner == owner)
-                if identifier:
-                    rows = q.filter(Note.id.startswith(identifier, autoescape=True)).limit(2).all()
-                else:
-                    title = _selector(args, ("title", "query", "text"))
-                    rows = q.filter(Note.title == title).limit(2).all() if title else []
+                # Notes shared with the caller resolve as well. An exact id
+                # wins, then the caller's own notes, so a shared note never
+                # shadows one of theirs (same order as the notes tool).
+                readable = notes_sharing.readable_notes_query(db, owner)
+                rows = readable.filter(Note.id == identifier).all() if identifier else []
+                if not rows:
+                    title = "" if identifier else _selector(args, ("title", "query", "text"))
+                    match = (Note.id.startswith(identifier, autoescape=True) if identifier
+                             else Note.title == title if title else None)
+                    if match is not None:
+                        rows = readable.filter(match, Note.owner == owner).limit(2).all()
+                        if not rows:
+                            rows = readable.filter(match).limit(2).all()
                 if len(rows) != 1:
                     raise ResourceIdentityError("Note selector is missing or ambiguous")
                 identifier = rows[0].id
