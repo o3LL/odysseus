@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from core.middleware import require_admin
 from src.auth_helpers import require_authenticated_request, require_user
 from src.tool_implementations import do_manage_notes
+from core.notes_sharing import AGENT_REFUSED_ACTIONS, SHARING_UI_ONLY_ERROR
 from src.constants import COOKBOOK_STATE_FILE
 from routes._validators import validate_remote_host, validate_ssh_port
 
@@ -288,6 +289,10 @@ def setup_codex_routes(
     @router.post("/todos")
     async def manage_todos(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
         action = str(body.get("action") or "add").replace("-", "_").strip().lower()
+        if action in AGENT_REFUSED_ACTIONS:
+            # Sharing is a human action in the Notes window, whatever the
+            # token's scopes; see core.notes_sharing.
+            raise HTTPException(403, SHARING_UI_ONLY_ERROR)
         allowed = TODO_WRITE_SCOPES if action in WRITE_ACTIONS else TODO_READ_SCOPES
         owner = _scope_owner(request, allowed)
         args = dict(body)

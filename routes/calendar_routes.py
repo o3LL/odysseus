@@ -6,6 +6,7 @@ import re
 import uuid
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
@@ -14,6 +15,9 @@ from sqlalchemy.exc import IntegrityError
 from dateutil.rrule import rrulestr
 
 from core.database import SessionLocal, CalendarCal, CalendarDeletedEvent, CalendarEvent, Note
+from core.notes_markdown import items_to_markdown
+from core.notes_sharing import delete_note_shares
+from core.note_versions import delete_note_versions
 from src.auth_helpers import effective_user, require_user
 from src.upload_limits import read_upload_limited, ICS_MAX_BYTES
 from src.upload_handler import reserve_upload_references
@@ -36,6 +40,19 @@ def _ics_naive_dtstart(dt):
     if isinstance(dt, date):
         return datetime(dt.year, dt.month, dt.day)
     return dt
+
+
+def _source_tzid(dt) -> str | None:
+    """IANA zone name of an imported tz-aware DTSTART, or None for naive/UTC values."""
+    tz = getattr(dt, "tzinfo", None) if isinstance(dt, datetime) else None
+    name = getattr(tz, "key", None) or getattr(tz, "zone", None)
+    if not name or name.upper() in {"UTC", "ETC/UTC"}:
+        return None
+    try:
+        ZoneInfo(name)
+    except Exception:
+        return None
+    return name
 
 
 def _ensure_positive_duration(start_dt, end_dt, all_day):
@@ -499,10 +516,13 @@ def _parse_dt_pair(s: str):
             return parsed.astimezone(_tz.utc).replace(tzinfo=None), True
         return parsed, False
     except ValueError:
-        return _parse_dt(s), False
+        parsed = _parse_dt(s, preserve_timezone=True)
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(_tz.utc).replace(tzinfo=None), True
+        return parsed, False
 
 
-def _parse_dt(s: str) -> datetime:
+def _parse_dt(s: str, *, preserve_timezone: bool = False) -> datetime:
     """Parse a date/datetime string.
 
     Strict ISO first (cheapest path; this is what most callers pass). On
@@ -515,7 +535,8 @@ def _parse_dt(s: str) -> datetime:
       - YYYY-MM-DD optionally followed by time
     Anything still unparsed falls to dateutil.parser, which handles most
     other absolute formats. Local-naive datetimes returned to match the
-    DB schema (CalendarEvent.dtstart is naive).
+    DB schema (CalendarEvent.dtstart is naive). ``preserve_timezone`` lets
+    _parse_dt_pair retain explicit offsets until it records UTC provenance.
     """
     import re as _re
     s = (s or "").strip()
@@ -529,7 +550,7 @@ def _parse_dt(s: str) -> datetime:
         parsed = datetime.fromisoformat(_s2)
         # Strip tz for the legacy callers — they expect naive. Real tz
         # handling lives in _parse_dt_pair.
-        if parsed.tzinfo is not None:
+        if parsed.tzinfo is not None and not preserve_timezone:
             from datetime import timezone as _tz
             return parsed.astimezone(_tz.utc).replace(tzinfo=None)
         return parsed
@@ -621,13 +642,13 @@ def _parse_dt(s: str) -> datetime:
     try:
         from dateutil import parser as _du
         parsed = _du.parse(s)
-        # Strip tz like every other return path above — this function's
-        # contract is naive datetimes (CalendarEvent.dtstart is naive). An
+        # By default strip tz like the ISO path above — legacy callers
+        # require naive datetimes (CalendarEvent.dtstart is naive). An
         # offset-bearing non-ISO input (e.g. RFC-2822 "Mon, 05 Jan 2026
         # 14:00:00 +0900") otherwise leaked tz-aware into the naive column and
         # crashed read-back comparisons in _expand_rrule with "can't compare
         # offset-naive and offset-aware datetimes".
-        if parsed.tzinfo is not None:
+        if parsed.tzinfo is not None and not preserve_timezone:
             from datetime import timezone as _tz
             return parsed.astimezone(_tz.utc).replace(tzinfo=None)
         return parsed
@@ -724,6 +745,8 @@ def _delete_calendar_reminders_for_event(db, owner: str, ev: CalendarEvent) -> i
         .all()
     )
     for note in notes:
+        delete_note_shares(db, note.id)
+        delete_note_versions(db, [note.id])
         db.delete(note)
     return len(notes)
 
@@ -751,7 +774,7 @@ def _create_calendar_reminder_for_event(db, owner: str, ev: CalendarEvent, minut
         id=str(uuid.uuid4()),
         owner=owner,
         title=f"Calendar reminder: {summary}",
-        items=json.dumps([{"text": f"{summary}{loc} — {start_fmt}", "done": False, "checked": False}]),
+        content=items_to_markdown([{"text": f"{summary}{loc} — {start_fmt}", "done": False}]),
         note_type="todo",
         label="calendar",
         due_date=due_date,
@@ -832,6 +855,19 @@ def _occurrence_exdate_key(uid: str, ev: CalendarEvent) -> str:
     return suffix[:16]
 
 
+def _source_zone(ev: CalendarEvent):
+    """Zone to expand a UTC-stored recurring event in, when its source TZID is known."""
+    tzid = getattr(ev, "tzid", None)
+    if not tzid or not getattr(ev, "is_utc", False) or ev.all_day:
+        return None
+    try:
+        zone = ZoneInfo(tzid)
+        rrulestr(ev.rrule, dtstart=ev.dtstart.replace(tzinfo=timezone.utc).astimezone(zone))
+    except Exception:
+        return None
+    return zone
+
+
 def _expand_rrule(
     ev: CalendarEvent, start: datetime, end: datetime, db=None, owner: str | None = None
 ) -> List[dict]:
@@ -858,8 +894,13 @@ def _expand_rrule(
         return [d]
 
     # Parse the rrule, applying it to the base dtstart.
+    source_zone = _source_zone(ev)
+    dtstart = (
+        ev.dtstart.replace(tzinfo=timezone.utc).astimezone(source_zone)
+        if source_zone else ev.dtstart
+    )
     rrule_str = ev.rrule
-    if ev.dtstart is not None and getattr(ev.dtstart, "tzinfo", None) is None:
+    if dtstart is not None and getattr(dtstart, "tzinfo", None) is None:
         # Events are stored with a naive (UTC) dtstart, but standard .ics
         # exporters (Google/Apple/Outlook/Fastmail) write the bound as an
         # absolute UTC value, e.g. UNTIL=20240105T090000Z. dateutil refuses to
@@ -872,7 +913,7 @@ def _expand_rrule(
             r"(UNTIL=\d{8}(?:T\d{6})?)Z", r"\1", rrule_str, flags=_re.IGNORECASE
         )
     try:
-        rule = rrulestr(rrule_str, dtstart=ev.dtstart)
+        rule = rrulestr(rrule_str, dtstart=dtstart)
     except Exception as ex:
         logger.warning(
             "Failed to parse rrule=%r for event %s: %s", ev.rrule, ev.uid, ex
@@ -898,7 +939,10 @@ def _expand_rrule(
     base = _event_to_dict(ev, db=db, owner=owner)
     exdates = set(_recurrence_exdates(ev))
 
-    for occ_start in rule.xafter(expand_start, inc=True):
+    xafter_start = expand_start.replace(tzinfo=timezone.utc) if source_zone else expand_start
+    for occ_start in rule.xafter(xafter_start, inc=True):
+        if source_zone:
+            occ_start = occ_start.astimezone(timezone.utc).replace(tzinfo=None)
         if occ_start >= end:
             break
 
@@ -1709,6 +1753,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     all_day=all_day,
                     is_utc=row_is_utc,
                     rrule=(comp.get("rrule").to_ical().decode() if comp.get("rrule") else ""),
+                    tzid=None if all_day else _source_tzid(dt_val),
                 )
                 db.add(ev)
                 event_uids.append(uid_val)

@@ -1,4 +1,9 @@
-"""Explicit null must clear nullable note fields; omission must preserve them."""
+"""Explicit null must clear nullable note fields; omission must preserve them.
+
+`content`, `items` and `image_url` are not separate columns here: checklists
+and images are markdown lines inside `content`. A null for any of them is not
+a request to delete the note's body, so it leaves the content as stored.
+"""
 
 import pytest
 from fastapi import FastAPI
@@ -29,9 +34,6 @@ def client(tmp_path, monkeypatch):
 @pytest.mark.parametrize("field,value", [
     ("due_date", "2030-10-08T09:00:00"),
     ("label", "home"),
-    ("image_url", "https://example.com/note.png"),
-    ("content", "Saved body"),
-    ("items", [{"text": "Saved item", "done": False}]),
     ("color", "blue"),
     ("gallery_id", "gallery-1"),
     ("agent_session_id", "chat-1"),
@@ -52,17 +54,39 @@ def test_explicit_null_clears_saved_field(client, field, value):
     assert updated.json()[field] is None
 
 
+FOLDED_BODY = {
+    "content": "Saved body",
+    "items": [{"text": "Saved item", "done": False}],
+    "image_url": "https://example.com/note.png",
+}
+
+
+def _assert_folded_body(saved):
+    assert saved["content"].startswith("Saved body")
+    assert "- [ ] Saved item" in saved["content"]
+    assert "![](https://example.com/note.png)" in saved["content"]
+
+
+@pytest.mark.parametrize("field", ["content", "items", "image_url"])
+def test_null_on_a_content_field_keeps_the_body(client, field):
+    created = client.post("/api/notes", json={"title": "Body", **FOLDED_BODY})
+    assert created.status_code == 200, created.text
+    path = f"/api/notes/{created.json()['id']}"
+    _assert_folded_body(client.get(path).json())
+
+    updated = client.put(path, json={field: None})
+    assert updated.status_code == 200, updated.text
+    _assert_folded_body(client.get(path).json())
+
+
 def test_omitted_fields_survive_title_edit(client):
     fields = {
         "due_date": "2030-10-08T09:00:00",
         "label": "home",
-        "image_url": "https://example.com/note.png",
-        "content": "Saved body",
-        "items": [{"text": "Saved item", "done": False}],
         "color": "blue",
         "gallery_id": "gallery-1",
     }
-    created = client.post("/api/notes", json={"title": "Before", **fields})
+    created = client.post("/api/notes", json={"title": "Before", **fields, **FOLDED_BODY})
     assert created.status_code == 200, created.text
     path = f"/api/notes/{created.json()['id']}"
     updated = client.put(path, json={"title": "After"})
@@ -71,6 +95,7 @@ def test_omitted_fields_survive_title_edit(client):
     assert saved["title"] == "After"
     for field, value in fields.items():
         assert saved[field] == value
+    _assert_folded_body(saved)
 
 
 def test_null_update_cannot_clear_another_users_note(client):

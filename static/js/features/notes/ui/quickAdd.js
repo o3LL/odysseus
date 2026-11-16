@@ -1,19 +1,14 @@
-/** Quick-add expansion, draft restoration and opening inline editors. */
+/** Quick-add bar: the start of a new note, which opens in the note window. */
 export function createQuickAdd({
-  _applyDraftToNote,
-  _applyMasonry,
-  _buildForm,
-  app,
+  openNewNote,
   openPanel,
-  state,
-  uiModule
+  state
 }) {
   function _renderQuickAdd(body) {
     const wrap = document.createElement('div');
     wrap.className = 'notes-quick-add';
-    // 2-pill Note/Todo toggle mirrors the full form's type-seg (minus Draw :
-    // drawing happens in the expanded form). The pill that's active steers
-    // both the placeholder and the type the form opens in.
+    // 2-pill Note/Todo toggle. The pill that's active steers both the
+    // placeholder and how the new note starts.
     wrap.innerHTML = `
     <div class="notes-quick-type-seg is-todo" role="group" aria-label="New item type">
       <button type="button" class="notes-quick-type-pill" data-type="note" aria-label="Note" aria-pressed="false" title="Note">
@@ -51,120 +46,26 @@ export function createQuickAdd({
         setType(p.dataset.type);
       });
     });
-    // Click input or type → expand to full form
-    const expandToForm = (initialType = 'note', initialText = '') => {
-      app.setEditingId('__new__');
-      const form = _buildForm({ note_type: initialType });
-      form.classList.add('note-form-new');
-      if (initialText) {
-        const titleEl = form.querySelector('.note-form-title');
-        if (titleEl) titleEl.value = initialText;
-      }
-      const mobileGrid = body.closest('.notes-pane')?.classList.contains('notes-view-grid')
-        && window.matchMedia('(max-width: 768px)').matches;
-      if (mobileGrid) {
-        form.style.gridColumn = '1 / -1';
-        form.style.gridRowEnd = 'span 64';
-      }
-      wrap.replaceWith(form);
-      _applyMasonry(body);
-      requestAnimationFrame(() => _applyMasonry(body));
-      const titleEl = form.querySelector('.note-form-title');
-      if (titleEl) {
-        titleEl.focus();
-        // Move caret to end
-        titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length);
-      }
+    // A click on the input or the first keystroke opens a new note window,
+    // carrying what was typed as its title; a to-do also starts with an empty
+    // task. Focus alone (stolen by a missed nearby click) opens nothing.
+    const expand = () => {
+      const text = input.value;
+      input.value = '';
+      openNewNote({ type: currentType, text });
     };
-    // Expand only on real intent: a click directly on the input, or actual
-    // typing. Focus alone : including focus stolen from a missed nearby
-    // click : no longer creates an empty form.
-    input.addEventListener('click', () => expandToForm(currentType, input.value));
-    input.addEventListener('input', () => expandToForm(currentType, input.value));
+    input.addEventListener('click', expand);
+    input.addEventListener('input', expand);
     wrap.querySelector('[data-action="photo"]').addEventListener('click', (e) => {
       e.stopPropagation();
-      expandToForm(currentType);
-      // Trigger photo input on the new form
-      setTimeout(() => document.querySelector('.note-form-photo-btn')?.click(), 50);
+      openNewNote({ type: currentType, text: '', pickImage: true });
     });
-  }
-
-  function _createNote(type = 'todo') {
-    const body = document.querySelector('#notes-pane .notes-pane-body');
-    if (!body || state.editingId === '__new__') return;
-    app.setEditingId('__new__');
-    // Restore an unsaved new-note draft if one survived a prior close/loss.
-    const { note: _n, restored } = _applyDraftToNote({ note_type: type }, '__new__');
-    const form = _buildForm(_n);
-    form.classList.add('note-form-new');
-    body.prepend(form);
-    const initialField = type === 'note'
-      ? form.querySelector('.note-form-content')
-      : form.querySelector('.note-cl-text, .note-form-title');
-    initialField?.focus();
-    if (restored) uiModule.showToast('Restored unsaved note');
   }
 
   function newNote() {
     if (!state.open) openPanel();
-    requestAnimationFrame(() => _createNote('note'));
+    requestAnimationFrame(() => openNewNote({ type: 'note' }));
   }
 
-  function _editNote(id) {
-    const note = state.notes.find(n => n.id === id);
-    if (!note) return;
-    app.setEditingId(id);
-    const card = document.querySelector(`.note-card[data-note-id="${id}"]`);
-    if (!card) return;
-    // Restore an unsaved draft (from a prior connection loss / close) over
-    // the saved note so the user picks up where they left off.
-    const { note: _n, restored } = _applyDraftToNote(note, id);
-    const form = _buildForm(_n);
-    card.replaceWith(form);
-    if (restored) uiModule.showToast('Restored unsaved changes');
-    // Pinned notes live in the first masonry column : the edit form has
-    // column-span:all, which can leave the form rendered above the fold or
-    // visually buried under neighboring pinned cards. Bring it into view
-    // (and onto a higher stacking context) so editing a pinned note always
-    // pops to the top.
-    form.style.position = 'relative';
-    form.style.zIndex = '5';
-    // Grid view: the form keeps the CSS default `grid-row-end: span 16` (64px)
-    // after replaceWith, which is much shorter than the actual form. Recompute
-    // masonry so the form gets the correct row span and cards below stop
-    // overlapping it. ResizeObserver inside _applyMasonry keeps it in sync as
-    // the user types / adds checklist items.
-    const _body = form.closest('.notes-pane-body');
-    if (_body) {
-      _applyMasonry(_body);
-      requestAnimationFrame(() => _applyMasonry(_body));
-    }
-    requestAnimationFrame(() => {
-      try { form.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
-      catch { form.scrollIntoView(); }
-    });
-    // Pick the most useful field to focus. On phones especially, the user
-    // taps Edit to type : landing in the title when there's already a title
-    // (and likely a body to extend) loses momentum. Prefer the body textarea
-    // for plain notes, the first checklist item for todos, fall back to title.
-    const _focusBest = () => {
-      if (note.note_type === 'note' || !note.note_type) {
-        const ta = form.querySelector('.note-form-content');
-        if (ta) { ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch {} return; }
-      }
-      if (note.note_type === 'todo' || note.note_type === 'goal' || note.note_type === 'checklist') {
-        // Last non-empty checklist row, or the first row if all empty.
-        const rows = form.querySelectorAll('.note-cl-row .note-cl-text');
-        let target = null;
-        for (const inp of rows) { if ((inp.value || '').trim()) target = inp; }
-        target = target || rows[0];
-        if (target) { target.focus(); try { target.setSelectionRange(target.value.length, target.value.length); } catch {} return; }
-      }
-      const titleEl = form.querySelector('.note-form-title');
-      if (titleEl) titleEl.focus();
-    };
-    _focusBest();
-  }
-
-  return { _renderQuickAdd, _createNote, newNote, _editNote };
+  return { _renderQuickAdd, newNote };
 }

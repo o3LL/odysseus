@@ -2040,6 +2040,8 @@ export async function loadSessions() {
     }
     sessions = _normalizeSessionsList(fetched);
     renderSessionList();
+    // The Notes context strip reads each chat's note from this list.
+    window.dispatchEvent(new CustomEvent('odysseus:sessions-loaded'));
 
     const sessionsSection = uiModule.el('sessions-section');
     const visibleSessions = sessions.filter(s => !s.archived && !_isUnsavedCompareSession(s));
