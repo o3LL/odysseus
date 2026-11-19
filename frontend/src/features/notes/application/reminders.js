@@ -1,5 +1,6 @@
 /** Page-owned reminder scheduler and notification delivery workflow. */
 import { _hasTimeComponent, _isDueTodayOrOverdue, _advanceRecurring } from '../domain/recurrence.js';
+import { reminderBody } from '../domain/noteRules.js';
 export function createNotesReminders({
   app,
   api,
@@ -10,7 +11,6 @@ export function createNotesReminders({
   effects,
   fetchNotes,
   isNoteFullyDone,
-  hasItems,
   dismissedKey
 }) {
   const state = app.state;
@@ -18,7 +18,6 @@ export function createNotesReminders({
   const _patchNote = api.patchNote;
   const _fetchNotes = fetchNotes;
   const _isNoteFullyDone = isNoteFullyDone;
-  const _hasItems = hasItems;
   const REMINDER_DISMISSED_AT_KEY = dismissedKey;
   const _updateRailBadge = effects.badge;
   let _reminderTimer = null;
@@ -31,7 +30,8 @@ export function createNotesReminders({
     const fired = _loadFiredReminders();
     let changed = false;
     for (const note of state.notes) {
-      if (!note.due_date || note.archived) continue;
+      // Reminders are the owner's: a shared note never fires here.
+      if (!note.due_date || note.archived || note.is_owner === false) continue;
       if (!_hasTimeComponent(note.due_date)) continue;
       if (fired.has(note.id)) continue;
       const due = new Date(note.due_date).getTime();
@@ -71,25 +71,10 @@ export function createNotesReminders({
 
   function _fireReminder(note) {
     const title = note.title || 'Note reminder';
-    // Include the verbatim note content so the email/notification actually
-    // shows what to do, not just a count. Cap the per-item lines (8 max) and
-    // total length so the body stays inbox-friendly.
-    let rawBody;
-    if (_hasItems(note)) {
-      const pending = (note.items || [])
-        .filter(i => !i.done && !i.checked)
-        .map(i => (i.text || '').trim())
-        .filter(Boolean);
-      if (pending.length) {
-        const shown = pending.slice(0, 8).map(t => `- ${t}`).join('\n');
-        const extra = pending.length > 8 ? `\n…and ${pending.length - 8} more` : '';
-        rawBody = `Pending (${pending.length}):\n${shown}${extra}`;
-      } else {
-        rawBody = `${(note.items || []).length} item${(note.items || []).length === 1 ? '' : 's'}`;
-      }
-    } else {
-      rawBody = (note.content || '').slice(0, 400);
-    }
+    // The note's prose and open tasks as plain text, by the same rules the
+    // server's reminder builder uses, so the local notification and the
+    // email/ntfy one say the same thing.
+    const rawBody = reminderBody(note.content);
 
     // Ask the server to dispatch according to user settings. The server may
     // return an LLM-written synthesis line and/or send an email. We still show
@@ -129,7 +114,7 @@ export function createNotesReminders({
   }
 
   function _countDueReminders() {
-    return state.notes.filter(n => !n.archived && _isDueTodayOrOverdue(n.due_date, clock) && !_isNoteFullyDone(n)).length;
+    return state.notes.filter(n => !n.archived && n.is_owner !== false && _isDueTodayOrOverdue(n.due_date, clock) && !_isNoteFullyDone(n)).length;
   }
 
   function _countFiredReminders() {
@@ -137,7 +122,7 @@ export function createNotesReminders({
     // and which fired after the last user dismissal.
     const now = clock.now();
     return state.notes.filter(n => {
-      if (n.archived || _isNoteFullyDone(n)) return false;
+      if (n.archived || n.is_owner === false || _isNoteFullyDone(n)) return false;
       if (!n.due_date || !_hasTimeComponent(n.due_date)) return false;
       const t = new Date(n.due_date).getTime();
       if (isNaN(t) || t > now) return false;
@@ -165,12 +150,18 @@ export function createNotesReminders({
     _updateRailBadge();
   }
 
+  // An open panel showing active notes owns the list and redraws it; swapping
+  // it here without a redraw left cards that no longer matched it, so a note
+  // deleted elsewhere kept its card and the 20 s re-read saw nothing new.
+  const panelOwnsList = () => state.open && !state.showingArchived;
+
   async function _initReminders() {
     try {
+      if (panelOwnsList()) { _startReminderLoop(); return; }
       const res = await api.listNotes(false);
       if (res.ok && !disposed) {
         const data = await res.json();
-        app.replaceNotes(data.notes || data || []);
+        if (!panelOwnsList()) app.replaceNotes(data.notes || data || []);
         _startReminderLoop();
       }
     } catch {}
