@@ -274,6 +274,9 @@ function _initHoverCardSpaceToggle() {
     }
     const id = _spaceWindowId(hoveredToggleWindow);
     if (!id) return;
+    // A window that is read or edited in place (a note) counts as in use
+    // while it is open, even when nothing in it has focus.
+    if (hoveredToggleWindow.closest?.('[data-space-minimize="off"]')) return;
     if (_spaceIsBlocked(e, hoveredToggleWindow)) return;
     e.preventDefault();
     Modals.minimize(id);
@@ -378,10 +381,14 @@ export function showToast(msg, durationOrOpts) {
   toastEl.classList.remove('toast-ai-reply-progress', 'toast-ai-reply-result', 'toast-sending', 'toast-message-sent', 'toast-transform-hint');
 
   let duration = 1200, actionLabel = null, onAction = null, actionHint = null, actionIcon = null, leadingIcon = null, toastClass = null, aiReplyProgress = false, aiReplyResult = false;
+  let secondaryLabel = null, onSecondaryAction = null;
   if (typeof durationOrOpts === 'object' && durationOrOpts) {
     duration = durationOrOpts.duration || 5000;
     actionLabel = durationOrOpts.action;
     onAction = durationOrOpts.onAction;
+    // An optional second, plain-text action before the main one.
+    secondaryLabel = durationOrOpts.secondaryAction || null;
+    onSecondaryAction = durationOrOpts.onSecondaryAction || null;
     actionHint = durationOrOpts.actionHint || null;
     actionIcon = durationOrOpts.actionIcon || null;
     leadingIcon = durationOrOpts.leadingIcon || null;
@@ -423,6 +430,24 @@ export function showToast(msg, durationOrOpts) {
   const actionGroup = document.createElement('span');
   actionGroup.className = 'toast-actions';
 
+  if (secondaryLabel && onSecondaryAction) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toast-action-btn';
+    const label = document.createElement('span');
+    label.textContent = secondaryLabel;
+    btn.appendChild(label);
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      toastEl.classList.remove('show');
+      toastEl.style.pointerEvents = '';
+      onSecondaryAction();
+    });
+    actionGroup.appendChild(btn);
+    toastEl.style.pointerEvents = 'auto';
+  }
+
   if (actionLabel && onAction) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -455,7 +480,7 @@ export function showToast(msg, durationOrOpts) {
     });
     actionGroup.appendChild(btn);
     toastEl.style.pointerEvents = 'auto';
-  } else {
+  } else if (!(secondaryLabel && onSecondaryAction)) {
     toastEl.style.pointerEvents = '';
   }
 
@@ -1331,6 +1356,9 @@ if ('ontouchstart' in window || window.innerWidth <= 768) {
     const isText = tag === 'INPUT' || tag === 'TEXTAREA' ||
                    (tag === 'DIV' && el.isContentEditable);
     if (!isText) return;
+    // A window that keeps its own fields in view while the keyboard is up
+    // opts out: centring a tall editor, or a title near the top, pans the page.
+    if (el.closest('[data-keyboard-scroll="off"]')) return;
     // Inputs of type button/checkbox/radio/range/etc. don't summon a keyboard
     if (tag === 'INPUT') {
       const t = (el.type || 'text').toLowerCase();
