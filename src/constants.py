@@ -78,6 +78,10 @@ BG_JOBS_FILE = os.path.join(DATA_DIR, "bg_jobs.json")
 CONTAINMENT_STATE_FILE = os.path.join(DATA_DIR, "containment_grants.json")
 VAULT_FILE = os.path.join(DATA_DIR, "vault.json")
 TIDY_CALENDAR_STATE_FILE = os.path.join(DATA_DIR, "tidy_calendar_state.json")
+# Claude Code runs: one private CLAUDE_CONFIG_DIR + workspace per Odysseus user.
+CLAUDE_CODE_DIR = os.path.join(DATA_DIR, "claude_code")
+# The bundled `odysseus` skill Claude Code uses to reach the scoped agent API.
+CLAUDE_CODE_SKILL_DIR = os.path.join(get_app_root(), "integrations", "claude", "skills", "odysseus")
 SKILLS_FILE = os.path.join(DATA_DIR, "skills.json")
 MODEL_CUSTOMIZATIONS_FILE = os.path.join(DATA_DIR, "model_customizations.json")
 APP_DB = os.path.join(DATA_DIR, "app.db")

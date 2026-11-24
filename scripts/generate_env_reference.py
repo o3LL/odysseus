@@ -453,6 +453,29 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "Thinking policy for the Qwen routing step. An unrecognized value falls back "
         "to `auto`.",
     ),
+    "ODYSSEUS_CLAUDE_CODE_PATH": (
+        "Model routing and providers", USER,
+        "Path to the `claude` binary used for Claude Code runs. Defaults to `claude` "
+        "on `PATH`.",
+    ),
+    "ODYSSEUS_CLAUDE_CODE_PERMISSION_MODE": (
+        "Model routing and providers", USER,
+        "Claude Code permission mode for runs: `acceptEdits` (default), `auto`, "
+        "`dontAsk` or `plan`. `bypassPermissions` is refused.",
+    ),
+    "ODYSSEUS_CLAUDE_CODE_MAX_RUNS": (
+        "Model routing and providers", USER,
+        "Claude Code runs allowed at once per server worker. Default 2.",
+    ),
+    "ODYSSEUS_CLAUDE_CODE_TIMEOUT": (
+        "Model routing and providers", USER,
+        "Seconds a Claude Code run may last before it is stopped. Default 1800.",
+    ),
+    "ODYSSEUS_CLAUDE_CODE_USERS": (
+        "Model routing and providers", USER,
+        "Who may start Claude Code runs: `admins` (default) or `all`. Each user "
+        "signs in to their own Claude Code with `scripts/claude_code_login.py`.",
+    ),
     "ODYSSEUS_COPILOT_CLIENT_ID": (
         "Model routing and providers", USER,
         "GitHub OAuth client id for the Copilot device flow. The default is the "

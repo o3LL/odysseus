@@ -965,6 +965,11 @@ app.include_router(setup_codex_routes(
 ))
 app.include_router(setup_claude_routes())
 
+# Claude Code runs: the other direction. Odysseus hands a task to the user's
+# own signed-in Claude Code CLI and streams what it does.
+from routes.claude_code_routes import setup_claude_code_routes
+app.include_router(setup_claude_code_routes())
+
 from routes.vault.vault_routes import setup_vault_routes
 app.include_router(setup_vault_routes())
 

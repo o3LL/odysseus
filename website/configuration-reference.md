@@ -21,7 +21,7 @@ described as a switch that turns something off, the read rejects `0`, `false`,
 `no` and `off` and treats everything else as on. The `Default` column is the
 value the code falls back to when the variable is unset, quoted from the source.
 
-The source tree reads **150** `ODYSSEUS_*` variables: 92 an operator may want to set, and 58 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
+The source tree reads **155** `ODYSSEUS_*` variables: 97 an operator may want to set, and 58 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
 
 > This page is generated. Edit `scripts/generate_env_reference.py` and
 > re-run it; `tests/test_env_reference.py` enforces that the committed page
@@ -59,6 +59,11 @@ The source tree reads **150** `ODYSSEUS_*` variables: 92 an operator may want to
 | Variable | Default | Read in | What it does |
 |---|---|---|---|
 | `ODYSSEUS_ALLOW_LOCAL_IMAGE_MODELS` | `''` | `routes/gallery/gallery_routes.py` | Set to 1, true, yes or on to allow local image-generation and editing backends to be reachable as image providers. |
+| `ODYSSEUS_CLAUDE_CODE_MAX_RUNS` | *unset* | `src/claude_code_runner.py` | Claude Code runs allowed at once per server worker. Default 2. |
+| `ODYSSEUS_CLAUDE_CODE_PATH` | *unset* | `src/claude_code_runner.py` | Path to the `claude` binary used for Claude Code runs. Defaults to `claude` on `PATH`. |
+| `ODYSSEUS_CLAUDE_CODE_PERMISSION_MODE` | *unset* | `src/claude_code_runner.py` | Claude Code permission mode for runs: `acceptEdits` (default), `auto`, `dontAsk` or `plan`. `bypassPermissions` is refused. |
+| `ODYSSEUS_CLAUDE_CODE_TIMEOUT` | *unset* | `src/claude_code_runner.py` | Seconds a Claude Code run may last before it is stopped. Default 1800. |
+| `ODYSSEUS_CLAUDE_CODE_USERS` | *unset* | `routes/claude_code_routes.py` | Who may start Claude Code runs: `admins` (default) or `all`. Each user signs in to their own Claude Code with `scripts/claude_code_login.py`. |
 | `ODYSSEUS_COPILOT_API_VERSION` | `'2026-06-01'` | `src/copilot.py` | Dated API-version header the Copilot models and chat endpoints require. |
 | `ODYSSEUS_COPILOT_CLIENT_ID` | `'01ab8ac9400c4e429b23'` | `src/copilot.py` | GitHub OAuth client id for the Copilot device flow. The default is the public VS Code client id; override it only with your own allow-listed app. |
 | `ODYSSEUS_DEEPSEEK_REASONING_EFFORT` | `'high'` | `src/llm_core.py` | Reasoning effort for DeepSeek. Only `high` and `max` are accepted; any other value falls back to the default. |
@@ -188,8 +193,8 @@ The source tree reads **150** `ODYSSEUS_*` variables: 92 an operator may want to
 
 | Variable | Default | Read in | What it does |
 |---|---|---|---|
-| `ODYSSEUS_API_TOKEN` | `''` | `integrations/claude/skills/odysseus/scripts/odysseus_api.py` (+1 more) | API token those scripts authenticate with. Both this and the URL are required; the scripts name whichever is missing. |
-| `ODYSSEUS_URL` | `''` | `integrations/claude/skills/odysseus/scripts/odysseus_api.py` (+1 more) | Base URL of the Odysseus instance the bundled integration scripts call. |
+| `ODYSSEUS_API_TOKEN` | `''` | `integrations/claude/skills/odysseus/scripts/odysseus_api.py` (+2 more) | API token those scripts authenticate with. Both this and the URL are required; the scripts name whichever is missing. |
+| `ODYSSEUS_URL` | `''` | `integrations/claude/skills/odysseus/scripts/odysseus_api.py` (+2 more) | Base URL of the Odysseus instance the bundled integration scripts call. |
 
 ## Internal and development-only variables
 
@@ -303,7 +308,7 @@ reads three ways, because no single pattern covers the codebase:
   lines, so one read lives inside a string literal.
 
 The three passes are not redundancy. A line-based grep for a direct
-`os.environ.get("ODYSSEUS_...` call finds 118 of the 150 variables on this
+`os.environ.get("ODYSSEUS_...` call finds 118 of the 155 variables on this
 page. What it misses is reads through an env-reader helper, reads whose call
 spans more than one line, reads whose variable name is held in a module
 constant, and reads through a mapping passed in as an argument - which is the
