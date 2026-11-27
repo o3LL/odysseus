@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from core.database import SessionLocal, ScheduledTask, TaskRun, NotificationLog
 from core.constants import internal_api_base
-from src.auth_helpers import get_current_user
+from src.auth_helpers import get_current_user, storage_owner_for_request
 from src.constants import DATA_DIR, EMAIL_URGENCY_CACHE_DIR
 from src.endpoint_resolver import resolve_owner_registered_endpoint_url
 from src.task_action_policy import (
@@ -310,6 +310,11 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     def _owner(request: Request):
         return get_current_user(request)
 
+    def _notification_owner(request: Request):
+        # With AUTH_ENABLED=false no request carries a user, so fall back to
+        # the reserved local owner instead of rejecting every toast.
+        return _owner(request) or storage_owner_for_request(request)
+
     async def _generate_task_name(prompt: str, owner: Optional[str] = None) -> str:
         """Use LLM to generate a short task name from the prompt."""
         try:
@@ -589,7 +594,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     @router.get("/notification-logs")
     async def get_notification_logs(request: Request, limit: int = 200):
         """Return persisted task notifications without consuming them."""
-        user = _owner(request)
+        user = _notification_owner(request)
         if not user:
             return {"notifications": []}
         limit = max(1, min(int(limit or 200), 1000))
@@ -617,7 +622,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     @router.post("/notification-logs")
     async def create_notification_log(request: Request):
         """Persist an in-app toast so Settings can show notification history."""
-        user = _owner(request)
+        user = _notification_owner(request)
         if not user:
             raise HTTPException(401, "Authentication required")
         body = await request.json()
